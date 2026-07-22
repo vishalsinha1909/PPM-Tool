@@ -1,0 +1,2376 @@
+import React, { useState, useMemo, useRef, useCallback, useEffect } from "react";
+import {
+  Plus,
+  Trash2,
+  Download,
+  Upload,
+  ZoomIn,
+  ZoomOut,
+  Users,
+  CalendarDays,
+  AlertTriangle,
+  Diamond,
+  ChevronDown,
+  Gauge,
+  X,
+  Link2,
+  ListChecks,
+  Flag,
+  MessageSquare,
+  ChevronRight,
+} from "lucide-react";
+
+/* =========================================================================
+   CONSTANTS
+========================================================================= */
+const ROW_H = 34;
+const HEADER_H = 46;
+const DEFAULT_DAY_W = 24;
+const MIN_DAY_W = 10;
+const MAX_DAY_W = 44;
+const HOURS_PER_DAY = 8;
+const REL_TYPES = ["FS", "SS", "FF", "SF"];
+
+const COLORS = {
+  ink: "#1B2430",
+  sub: "#5B6674",
+  canvas: "#F3F5F8",
+  surface: "#FFFFFF",
+  grid: "#E4E8EE",
+  weekend: "#EAEEF2",
+  primary: "#2C5F73",
+  primaryDark: "#1E4552",
+  critical: "#C1443B",
+  criticalDark: "#8F2F28",
+  milestone: "#D9A441",
+  float: "#B9C2CC",
+  today: "#3D8BFF",
+};
+
+/* =========================================================================
+   ID / DATE HELPERS
+========================================================================= */
+let idCounter = 1;
+const genId = () => `t${idCounter++}`;
+let resIdCounter = 1;
+const genResId = () => `r${resIdCounter++}`;
+let actionIdCounter = 1;
+const genActionId = () => `a${actionIdCounter++}`;
+let raidIdCounter = 1;
+const genRaidId = () => `raid${raidIdCounter++}`;
+// For nested items (comments, risk responses) — no reset needed since they're
+// never regenerated deterministically like the sample data above.
+const genNoteId = () => `n${Date.now()}${Math.floor(Math.random() * 10000)}`;
+
+const isWeekend = (d) => {
+  const day = d.getDay();
+  return day === 0 || day === 6;
+};
+
+const toISO = (d) => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+};
+
+const fmtDate = (d) =>
+  d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+
+const fmtShort = (d) => d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+// n workdays after start (start counted as offset 0)
+const addWorkdays = (start, n) => {
+  const d = new Date(start);
+  while (isWeekend(d)) d.setDate(d.getDate() + 1);
+  let count = 0;
+  const safeN = Math.max(0, Math.round(n));
+  while (count < safeN) {
+    d.setDate(d.getDate() + 1);
+    if (!isWeekend(d)) count++;
+  }
+  return d;
+};
+
+const dayIndexToDate = (projectStart, dayIndex) => addWorkdays(projectStart, dayIndex);
+
+// Inverse of dayIndexToDate: how many workdays is dateStr from projectStart
+// (can be negative if dateStr is before the project start). Used so a
+// manually-typed override date can be positioned on the same day-grid as
+// the CPM-computed dates.
+const dateStrToWorkdayOffset = (projectStart, dateStr) => {
+  if (!dateStr) return 0;
+  const target = new Date(dateStr + "T00:00:00");
+  let d = new Date(projectStart);
+  while (isWeekend(d)) d.setDate(d.getDate() + 1);
+  if (toISO(d) === toISO(target)) return 0;
+  const forward = target > d;
+  let count = 0;
+  let guard = 0;
+  while (toISO(d) !== toISO(target) && guard < 10000) {
+    d.setDate(d.getDate() + (forward ? 1 : -1));
+    if (!isWeekend(d)) count += forward ? 1 : -1;
+    guard++;
+  }
+  return count;
+};
+
+// Resolves a task's on-screen (start, finish) day-offsets, taking manual
+// date overrides into account. Falls back to the CPM-computed schedule
+// (plus any resource-leveling delay) when no override is set. Overrides
+// are purely a display/tracking layer — they don't ripple into successor
+// scheduling, which still uses the computed dates.
+function resolveEffectiveRange(task, sch, delay, projectStart) {
+  const baseEs = sch.es + delay;
+  const baseEf = sch.ef + delay;
+  let es = baseEs;
+  let ef = baseEf;
+  const hasStartOverride = !!task.overrideStart;
+  const hasFinishOverride = !!task.overrideFinish;
+
+  if (hasStartOverride) es = dateStrToWorkdayOffset(projectStart, task.overrideStart);
+  if (hasFinishOverride) ef = dateStrToWorkdayOffset(projectStart, task.overrideFinish);
+  if (hasStartOverride && !hasFinishOverride) ef = es + (task.duration || 0);
+  if (!hasStartOverride && hasFinishOverride) es = ef - (task.duration || 0);
+
+  return {
+    es,
+    ef,
+    overridden: hasStartOverride || hasFinishOverride,
+    baseEs,
+    baseEf,
+  };
+}
+
+/* =========================================================================
+   PREDECESSOR PARSING  e.g.  "2FS+1, 3SS, 4FF-2"
+========================================================================= */
+function parsePredecessors(str, validIds) {
+  if (!str) return [];
+  return str
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((token) => {
+      const m = token.match(/^(\d+|t\d+)\s*(FS|SS|FF|SF)?\s*([+-]\d+)?$/i);
+      if (!m) return null;
+      const rawId = m[1];
+      const id = rawId.startsWith("t") ? rawId : `t${rawId}`;
+      const type = (m[2] || "FS").toUpperCase();
+      const lag = m[3] ? parseInt(m[3], 10) : 0;
+      return { id, type, lag };
+    })
+    .filter((p) => p && (validIds ? validIds.has(p.id) : true));
+}
+
+function formatPredecessors(preds, wbsById) {
+  if (!preds || preds.length === 0) return "";
+  return preds
+    .map((p) => {
+      const num = wbsById.get(p.id) ?? p.id.replace("t", "");
+      const typePart = p.type && p.type !== "FS" ? p.type : "";
+      const lagPart = p.lag ? (p.lag > 0 ? `+${p.lag}` : `${p.lag}`) : "";
+      return `${num}${typePart}${lagPart}`;
+    })
+    .join(", ");
+}
+
+/* =========================================================================
+   CPM SCHEDULING ENGINE
+========================================================================= */
+function computeSchedule(tasks, projectStart) {
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const validIds = new Set(tasks.map((t) => t.id));
+
+  const indegree = new Map(tasks.map((t) => [t.id, 0]));
+  const successors = new Map(tasks.map((t) => [t.id, []]));
+
+  tasks.forEach((t) => {
+    (t.predecessors || []).forEach((p) => {
+      if (byId.has(p.id) && p.id !== t.id) {
+        indegree.set(t.id, indegree.get(t.id) + 1);
+        successors.get(p.id).push({ id: t.id, type: p.type, lag: p.lag || 0 });
+      }
+    });
+  });
+
+  const queue = tasks.filter((t) => indegree.get(t.id) === 0).map((t) => t.id);
+  const indegreeCopy = new Map(indegree);
+  const order = [];
+  while (queue.length) {
+    const id = queue.shift();
+    order.push(id);
+    successors.get(id).forEach((s) => {
+      indegreeCopy.set(s.id, indegreeCopy.get(s.id) - 1);
+      if (indegreeCopy.get(s.id) === 0) queue.push(s.id);
+    });
+  }
+  const hasCycle = order.length !== tasks.length;
+  // If a cycle exists, fall back to declared order for the tasks not resolved,
+  // so the UI still renders something instead of breaking.
+  if (hasCycle) {
+    tasks.forEach((t) => {
+      if (!order.includes(t.id)) order.push(t.id);
+    });
+  }
+
+  const ES = new Map(),
+    EF = new Map();
+  order.forEach((id) => {
+    const t = byId.get(id);
+    let es = 0;
+    (t.predecessors || []).forEach((p) => {
+      if (!byId.has(p.id) || !ES.has(p.id)) return;
+      const lag = p.lag || 0;
+      const pES = ES.get(p.id),
+        pEF = EF.get(p.id);
+      switch (p.type) {
+        case "SS":
+          es = Math.max(es, pES + lag);
+          break;
+        case "FF":
+          es = Math.max(es, pEF + lag - t.duration);
+          break;
+        case "SF":
+          es = Math.max(es, pES + lag - t.duration);
+          break;
+        default:
+          es = Math.max(es, pEF + lag);
+      }
+    });
+    es = Math.max(es, 0);
+    ES.set(id, es);
+    EF.set(id, es + (t.duration || 0));
+  });
+
+  const projectDuration = tasks.length ? Math.max(0, ...tasks.map((t) => EF.get(t.id) || 0)) : 0;
+
+  const LF = new Map(),
+    LS = new Map();
+  [...order].reverse().forEach((id) => {
+    const t = byId.get(id);
+    const succs = successors.get(id).filter((s) => ES.has(s.id));
+    let lf;
+    if (succs.length === 0) {
+      lf = projectDuration;
+    } else {
+      lf = Math.min(
+        ...succs.map((s) => {
+          const lag = s.lag || 0;
+          const sES = ES.get(s.id),
+            sEF = EF.get(s.id);
+          switch (s.type) {
+            case "SS":
+              return LS.get(s.id) !== undefined ? LS.get(s.id) - lag : sES - lag + t.duration;
+            case "FF":
+              return (LF.get(s.id) !== undefined ? LF.get(s.id) : sEF) - lag;
+            case "SF":
+              return (LS.get(s.id) !== undefined ? LS.get(s.id) : sES) - lag;
+            default:
+              return (LS.get(s.id) !== undefined ? LS.get(s.id) : sES) - lag;
+          }
+        })
+      );
+    }
+    LF.set(id, lf);
+    LS.set(id, lf - (t.duration || 0));
+  });
+
+  const schedule = {};
+  tasks.forEach((t) => {
+    const es = ES.get(t.id) ?? 0;
+    const ef = EF.get(t.id) ?? 0;
+    const ls = LS.get(t.id) ?? 0;
+    const lf = LF.get(t.id) ?? 0;
+    const float = Math.round((ls - es) * 100) / 100;
+    schedule[t.id] = {
+      es,
+      ef,
+      ls,
+      lf,
+      float,
+      critical: float <= 0,
+      startDate: dayIndexToDate(projectStart, es),
+      finishDate: dayIndexToDate(projectStart, ef),
+    };
+  });
+
+  return { schedule, hasCycle, projectDuration, order, validIds };
+}
+
+/* =========================================================================
+   RESOURCE LOAD + NAIVE LEVELING
+========================================================================= */
+function buildResourceLoad(tasks, resources, schedule, projectStart, delays = {}) {
+  const load = new Map();
+  resources.forEach((r) => load.set(r.id, new Map()));
+
+  tasks.forEach((t) => {
+    if (t.milestone) return;
+    const sch = schedule[t.id];
+    if (!sch) return;
+    const delay = delays[t.id] || 0;
+    const es = sch.es + delay;
+    const ef = sch.ef + delay;
+    (t.resources || []).forEach((asn) => {
+      const rMap = load.get(asn.resourceId);
+      if (!rMap) return;
+      for (let d = es; d < ef; d++) {
+        const date = toISO(dayIndexToDate(projectStart, d));
+        rMap.set(date, (rMap.get(date) || 0) + asn.units);
+      }
+    });
+  });
+  return load;
+}
+
+function findOverallocations(resources, load) {
+  const issues = [];
+  resources.forEach((r) => {
+    const rMap = load.get(r.id);
+    if (!rMap) return;
+    rMap.forEach((units, date) => {
+      if (units > (r.maxUnits || 100) + 0.01) {
+        issues.push({ resourceId: r.id, date, units, max: r.maxUnits || 100 });
+      }
+    });
+  });
+  return issues.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// Greedy leveler: pushes non-critical tasks later (within available float)
+// day-by-day whenever they overlap another task on the same resource that
+// has already been placed. Best-effort — not a guaranteed optimal solution.
+function levelResources(tasks, resources, schedule, projectStart) {
+  const delays = {};
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const placedLoad = new Map(resources.map((r) => [r.id, new Map()]));
+
+  const ordered = [...tasks]
+    .filter((t) => schedule[t.id])
+    .sort((a, b) => schedule[a.id].es - schedule[b.id].es);
+
+  const stillOver = [];
+
+  ordered.forEach((t) => {
+    const sch = schedule[t.id];
+    if (t.milestone || !t.resources || t.resources.length === 0) {
+      delays[t.id] = 0;
+      return;
+    }
+    let delay = 0;
+    const maxDelay = Math.max(0, sch.float); // never push critical tasks (float 0)
+    let conflict = true;
+    let guard = 0;
+    while (conflict && guard <= maxDelay) {
+      conflict = false;
+      const es = sch.es + delay;
+      const ef = sch.ef + delay;
+      for (const asn of t.resources) {
+        const res = resources.find((r) => r.id === asn.resourceId);
+        if (!res) continue;
+        const rMap = placedLoad.get(asn.resourceId);
+        for (let d = es; d < ef; d++) {
+          const date = toISO(dayIndexToDate(projectStart, d));
+          const existing = rMap.get(date) || 0;
+          if (existing + asn.units > (res.maxUnits || 100) + 0.01) {
+            conflict = true;
+            break;
+          }
+        }
+        if (conflict) break;
+      }
+      if (conflict) {
+        delay += 1;
+        guard += 1;
+      }
+    }
+    if (conflict && delay >= maxDelay) {
+      // could not fully resolve within float — record best effort, flag it
+      delay = maxDelay;
+      stillOver.push(t.id);
+    }
+    delays[t.id] = delay;
+    const es = sch.es + delay;
+    const ef = sch.ef + delay;
+    t.resources.forEach((asn) => {
+      const rMap = placedLoad.get(asn.resourceId);
+      for (let d = es; d < ef; d++) {
+        const date = toISO(dayIndexToDate(projectStart, d));
+        rMap.set(date, (rMap.get(date) || 0) + asn.units);
+      }
+    });
+  });
+
+  return { delays, unresolved: stillOver };
+}
+
+/* =========================================================================
+   COST
+========================================================================= */
+function computeCost(tasks, resources) {
+  const rateById = new Map(resources.map((r) => [r.id, r.rate || 0]));
+  let total = 0;
+  const byTask = {};
+  tasks.forEach((t) => {
+    let c = 0;
+    (t.resources || []).forEach((asn) => {
+      const rate = rateById.get(asn.resourceId) || 0;
+      const hours = (t.duration || 0) * HOURS_PER_DAY * (asn.units / 100);
+      c += hours * rate;
+    });
+    byTask[t.id] = c;
+    total += c;
+  });
+  return { total, byTask };
+}
+
+/* =========================================================================
+   EXPORT / IMPORT
+========================================================================= */
+// Saves via the native OS save dialog when running inside the Electron
+// shell (window.desktop is injected by electron/preload.cjs); falls back
+// to a plain browser download so the same component still works when run
+// with `npm run dev` in an ordinary browser tab.
+async function saveContent(filename, content, mime, dialogFilters) {
+  if (window.desktop?.saveFile) {
+    const res = await window.desktop.saveFile({ defaultName: filename, content, filters: dialogFilters });
+    return res;
+  }
+  const blob = new Blob([content], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  return { canceled: false };
+}
+
+function exportJSON(project) {
+  return saveContent(
+    `${project.name.replace(/\s+/g, "_")}.json`,
+    JSON.stringify(project, null, 2),
+    "application/json",
+    [{ name: "JSON Project", extensions: ["json"] }]
+  );
+}
+
+function exportCSV(tasks, wbsById, effective, projectStart) {
+  const rows = [
+    [
+      "WBS",
+      "Name",
+      "Duration(days)",
+      "Milestone",
+      "Predecessors",
+      "Resources(name:units%)",
+      "Start",
+      "Finish",
+      "Revised?",
+    ],
+  ];
+  tasks.forEach((t, i) => {
+    const eff = effective?.[t.id];
+    rows.push([
+      i + 1,
+      t.name,
+      t.duration,
+      t.milestone ? "Yes" : "No",
+      formatPredecessors(t.predecessors, wbsById),
+      (t.resources || []).map((a) => `${a.resourceId}:${a.units}`).join(" "),
+      eff ? toISO(dayIndexToDate(projectStart, eff.es)) : "",
+      eff ? toISO(dayIndexToDate(projectStart, eff.ef)) : "",
+      eff?.overridden ? "Yes" : "No",
+    ]);
+  });
+  const csv = rows
+    .map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(","))
+    .join("\n");
+  return saveContent("tasks.csv", csv, "text/csv", [{ name: "CSV", extensions: ["csv"] }]);
+}
+
+// Simplified Project XML interchange (MSPDI-inspired structure).
+// This is NOT the proprietary binary .mpp format — that format is closed
+// and can't be reliably read/written from a browser. This XML schema
+// mirrors the same concepts (tasks, UIDs, predecessor links, durations)
+// that MS Project / ProjectLibre use for their own XML interchange, so a
+// project round-trips within this app and stays human-readable.
+function exportXML(project) {
+  const esc = (s) => String(s).replace(/[<>&'"]/g, (c) => ({
+    "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;",
+  }[c]));
+  const tasksXML = project.tasks
+    .map(
+      (t, i) => `
+    <Task>
+      <UID>${esc(t.id)}</UID>
+      <ID>${i + 1}</ID>
+      <Name>${esc(t.name)}</Name>
+      <Duration>${t.duration}d</Duration>
+      <Milestone>${t.milestone ? 1 : 0}</Milestone>
+      <PredecessorLink>${(t.predecessors || [])
+        .map((p) => `${esc(p.id)}:${p.type}:${p.lag || 0}`)
+        .join(";")}</PredecessorLink>
+      <Assignments>${(t.resources || [])
+        .map((a) => `${esc(a.resourceId)}:${a.units}`)
+        .join(";")}</Assignments>
+    </Task>`
+    )
+    .join("");
+  const resXML = project.resources
+    .map(
+      (r) => `
+    <Resource>
+      <UID>${esc(r.id)}</UID>
+      <Name>${esc(r.name)}</Name>
+      <Rate>${r.rate}</Rate>
+      <MaxUnits>${r.maxUnits}</MaxUnits>
+    </Resource>`
+    )
+    .join("");
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<Project>
+  <Name>${esc(project.name)}</Name>
+  <StartDate>${toISO(new Date(project.projectStart))}</StartDate>
+  <Tasks>${tasksXML}
+  </Tasks>
+  <Resources>${resXML}
+  </Resources>
+</Project>`;
+  return saveContent(`${project.name.replace(/\s+/g, "_")}.xml`, xml, "application/xml", [
+    { name: "Project XML", extensions: ["xml"] },
+  ]);
+}
+
+function parseImportedJSON(text) {
+  const data = JSON.parse(text);
+  if (!data.tasks || !data.resources) throw new Error("Missing tasks/resources");
+  data.actionItems = (data.actionItems || []).map((a) => ({
+    ...a,
+    comments: a.comments || [],
+    originalDueDate: a.originalDueDate || a.dueDate,
+  }));
+  data.raidLog = (data.raidLog || []).map((r) => ({
+    ...r,
+    eta: r.eta || r.dateRaised || toISO(new Date()),
+    responseStrategy: r.responseStrategy || "Mitigate",
+    responses: r.responses || (r.response ? [{ id: genNoteId(), text: r.response, date: r.dateRaised || toISO(new Date()) }] : []),
+  }));
+  return data;
+}
+
+function parseImportedXML(text) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(text, "application/xml");
+  const perr = doc.querySelector("parsererror");
+  if (perr) throw new Error("Invalid XML");
+  const name = doc.querySelector("Project > Name")?.textContent || "Imported Project";
+  const startDate = doc.querySelector("Project > StartDate")?.textContent || toISO(new Date());
+  const resources = Array.from(doc.querySelectorAll("Resources > Resource")).map((r) => ({
+    id: r.querySelector("UID")?.textContent,
+    name: r.querySelector("Name")?.textContent,
+    rate: parseFloat(r.querySelector("Rate")?.textContent || "0"),
+    maxUnits: parseFloat(r.querySelector("MaxUnits")?.textContent || "100"),
+  }));
+  const tasks = Array.from(doc.querySelectorAll("Tasks > Task")).map((t) => {
+    const predText = t.querySelector("PredecessorLink")?.textContent || "";
+    const predecessors = predText
+      .split(";")
+      .filter(Boolean)
+      .map((chunk) => {
+        const [id, type, lag] = chunk.split(":");
+        return { id, type: type || "FS", lag: parseInt(lag || "0", 10) };
+      });
+    const asnText = t.querySelector("Assignments")?.textContent || "";
+    const resAssignments = asnText
+      .split(";")
+      .filter(Boolean)
+      .map((chunk) => {
+        const [resourceId, units] = chunk.split(":");
+        return { resourceId, units: parseFloat(units || "100") };
+      });
+    return {
+      id: t.querySelector("UID")?.textContent,
+      name: t.querySelector("Name")?.textContent,
+      duration: parseFloat((t.querySelector("Duration")?.textContent || "0d").replace("d", "")),
+      milestone: t.querySelector("Milestone")?.textContent === "1",
+      predecessors,
+      resources: resAssignments,
+    };
+  });
+  return { name, projectStart: startDate, tasks, resources, actionItems: [], raidLog: [] };
+}
+
+/* =========================================================================
+   SAMPLE DATA
+========================================================================= */
+function sampleProject() {
+  idCounter = 1;
+  resIdCounter = 1;
+  actionIdCounter = 1;
+  raidIdCounter = 1;
+  const r1 = genResId(); // Designer
+  const r2 = genResId(); // Developer
+  const r3 = genResId(); // QA
+  const r4 = genResId(); // PM
+
+  const t1 = genId();
+  const t2 = genId();
+  const t3 = genId();
+  const t4 = genId();
+  const t5 = genId();
+  const t6 = genId();
+  const t7 = genId();
+  const t8 = genId();
+
+  const projectStart = toISO(new Date());
+  // demo a manually-revised finish date on Bug Fixes, a few days later than
+  // the computed date, to show the strike-through/override feature on load
+  const revisedBugFixFinish = toISO(addWorkdays(new Date(projectStart), 26));
+
+  return {
+    name: "Website Relaunch",
+    projectStart,
+    resources: [
+      { id: r1, name: "Designer", rate: 45, maxUnits: 100 },
+      { id: r2, name: "Developer", rate: 60, maxUnits: 100 },
+      { id: r3, name: "QA Engineer", rate: 40, maxUnits: 100 },
+      { id: r4, name: "Project Manager", rate: 55, maxUnits: 100 },
+    ],
+    tasks: [
+      { id: t1, name: "Kickoff & Requirements", duration: 3, milestone: false, predecessors: [], resources: [{ resourceId: r4, units: 100 }] },
+      { id: t2, name: "Wireframes", duration: 4, milestone: false, predecessors: [{ id: t1, type: "FS", lag: 0 }], resources: [{ resourceId: r1, units: 100 }] },
+      { id: t3, name: "Visual Design", duration: 5, milestone: false, predecessors: [{ id: t2, type: "FS", lag: 0 }], resources: [{ resourceId: r1, units: 100 }] },
+      { id: t4, name: "Frontend Build", duration: 8, milestone: false, predecessors: [{ id: t3, type: "FS", lag: 0 }], resources: [{ resourceId: r2, units: 100 }] },
+      { id: t5, name: "Backend Integration", duration: 6, milestone: false, predecessors: [{ id: t3, type: "FS", lag: 0 }], resources: [{ resourceId: r2, units: 100 }] },
+      { id: t6, name: "QA Testing", duration: 4, milestone: false, predecessors: [{ id: t4, type: "FS", lag: 0 }, { id: t5, type: "FS", lag: 0 }], resources: [{ resourceId: r3, units: 100 }] },
+      { id: t7, name: "Bug Fixes", duration: 3, milestone: false, predecessors: [{ id: t6, type: "FS", lag: 0 }], resources: [{ resourceId: r2, units: 50 }, { resourceId: r3, units: 50 }], overrideFinish: revisedBugFixFinish },
+      { id: t8, name: "Launch", duration: 0, milestone: true, predecessors: [{ id: t7, type: "FS", lag: 0 }], resources: [] },
+    ],
+    actionItems: [
+      { id: genActionId(), title: "Confirm hosting provider before Frontend Build starts", owner: "Project Manager", dueDate: toISO(addWorkdays(new Date(projectStart), 7)), originalDueDate: toISO(addWorkdays(new Date(projectStart), 5)), priority: "High", status: "Open", comments: [{ id: genNoteId(), text: "Shortlisted two providers, comparing pricing tiers", date: projectStart }] },
+      { id: genActionId(), title: "Get sign-off on visual design from stakeholders", owner: "Designer", dueDate: toISO(addWorkdays(new Date(projectStart), 10)), originalDueDate: toISO(addWorkdays(new Date(projectStart), 10)), priority: "Medium", status: "Open", comments: [] },
+      { id: genActionId(), title: "Set up staging environment", owner: "Developer", dueDate: toISO(addWorkdays(new Date(projectStart), 12)), originalDueDate: toISO(addWorkdays(new Date(projectStart), 12)), priority: "Medium", status: "In Progress", comments: [] },
+    ],
+    raidLog: [
+      { id: genRaidId(), type: "Risk", description: "Key developer may be pulled onto another project mid-sprint", owner: "Project Manager", impact: "High", likelihood: "Medium", status: "Open", dateRaised: projectStart, eta: toISO(addWorkdays(new Date(projectStart), 8)), responseStrategy: "Mitigate", responses: [{ id: genNoteId(), text: "Cross-train QA engineer on backend basics as backup", date: projectStart }] },
+      { id: genRaidId(), type: "Assumption", description: "Stakeholders are available for design sign-off within 2 business days of request", owner: "Designer", impact: "Medium", likelihood: "-", status: "Open", dateRaised: projectStart, eta: toISO(addWorkdays(new Date(projectStart), 3)), responseStrategy: "Monitor", responses: [] },
+      { id: genRaidId(), type: "Issue", description: "Current hosting plan may not support expected launch traffic", owner: "Developer", impact: "High", likelihood: "-", status: "Open", dateRaised: toISO(addWorkdays(new Date(projectStart), 2)), eta: toISO(addWorkdays(new Date(projectStart), 6)), responseStrategy: "Mitigate", responses: [{ id: genNoteId(), text: "Evaluating upgraded hosting tier", date: toISO(addWorkdays(new Date(projectStart), 2)) }] },
+      { id: genRaidId(), type: "Dependency", description: "Launch depends on third-party payment gateway approval", owner: "Project Manager", impact: "High", likelihood: "Medium", status: "Open", dateRaised: projectStart, eta: toISO(addWorkdays(new Date(projectStart), 9)), responseStrategy: "Escalate", responses: [{ id: genNoteId(), text: "Submitted application; awaiting approval", date: projectStart }] },
+    ],
+  };
+}
+
+/* =========================================================================
+   DATE CELL — click to set a manual override date; shows the original
+   computed date struck through alongside the new one when overridden.
+========================================================================= */
+function DateCell({ computedDate, overrideISO, onChange, onClear }) {
+  const [editing, setEditing] = useState(false);
+
+  if (editing) {
+    return (
+      <input
+        type="date"
+        autoFocus
+        defaultValue={overrideISO || toISO(computedDate)}
+        onBlur={(e) => {
+          if (e.target.value) onChange(e.target.value);
+          setEditing(false);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            if (e.target.value) onChange(e.target.value);
+            setEditing(false);
+          }
+          if (e.key === "Escape") setEditing(false);
+        }}
+        className="w-full text-xs border border-gray-300 rounded px-0.5 mono"
+      />
+    );
+  }
+
+  if (overrideISO) {
+    return (
+      <div className="flex items-center gap-1 text-xs group cursor-pointer" onClick={() => setEditing(true)}>
+        <s className="mono text-gray-400" style={{ fontSize: 10 }}>
+          {fmtShort(computedDate)}
+        </s>
+        <span className="mono font-semibold" style={{ color: COLORS.milestone }}>
+          {fmtShort(new Date(overrideISO + "T00:00:00"))}
+        </span>
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            onClear();
+          }}
+          className="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-500 shrink-0"
+          title="Clear revised date"
+        >
+          <X size={10} />
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className="text-xs mono text-gray-600 cursor-pointer hover:text-gray-900 hover:underline decoration-dotted"
+      onClick={() => setEditing(true)}
+      title="Click to set a revised date"
+    >
+      {fmtShort(computedDate)}
+    </div>
+  );
+}
+
+/* =========================================================================
+   MAIN APP
+========================================================================= */
+export default function App() {
+  const [project, setProject] = useState(sampleProject());
+  const [dayW, setDayW] = useState(DEFAULT_DAY_W);
+  const [leveled, setLeveled] = useState(false);
+  const [tab, setTab] = useState("schedule");
+  const [selectedResourceId, setSelectedResourceId] = useState(null);
+  const [importError, setImportError] = useState("");
+  const [flash, setFlash] = useState("");
+  const [depEditor, setDepEditor] = useState(null); // { taskId, top, left } | null
+  const fileInputRef = useRef(null);
+
+  const tableScrollRef = useRef(null);
+  const ganttScrollRef = useRef(null);
+  const syncingRef = useRef(false);
+
+  const projectStart = useMemo(() => new Date(project.projectStart + "T00:00:00"), [project.projectStart]);
+
+  const { schedule, hasCycle, projectDuration } = useMemo(
+    () => computeSchedule(project.tasks, projectStart),
+    [project.tasks, projectStart]
+  );
+
+  const { delays, unresolved } = useMemo(() => {
+    if (!leveled) return { delays: {}, unresolved: [] };
+    return levelResources(project.tasks, project.resources, schedule, projectStart);
+  }, [leveled, project.tasks, project.resources, schedule, projectStart]);
+
+  const load = useMemo(
+    () => buildResourceLoad(project.tasks, project.resources, schedule, projectStart, delays),
+    [project.tasks, project.resources, schedule, projectStart, delays]
+  );
+
+  const overallocations = useMemo(() => findOverallocations(project.resources, load), [
+    project.resources,
+    load,
+  ]);
+
+  const cost = useMemo(() => computeCost(project.tasks, project.resources), [
+    project.tasks,
+    project.resources,
+  ]);
+
+  const wbsById = useMemo(() => {
+    const m = new Map();
+    project.tasks.forEach((t, i) => m.set(t.id, i + 1));
+    return m;
+  }, [project.tasks]);
+
+  const criticalCount = useMemo(
+    () => project.tasks.filter((t) => schedule[t.id]?.critical).length,
+    [project.tasks, schedule]
+  );
+
+  const totalSpan = Math.max(projectDuration, 1) + 4; // small buffer for display
+
+  const effective = useMemo(() => {
+    const map = {};
+    project.tasks.forEach((t) => {
+      const sch = schedule[t.id];
+      if (!sch) return;
+      map[t.id] = resolveEffectiveRange(t, sch, delays[t.id] || 0, projectStart);
+    });
+    return map;
+  }, [project.tasks, schedule, delays, projectStart]);
+
+  const openDependencyEditor = (e, taskId) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    setDepEditor({ taskId, top: rect.bottom + 4, left: Math.min(rect.left, window.innerWidth - 300) });
+  };
+
+  const toggleDependency = (taskId, predId) => {
+    setProject((p) => ({
+      ...p,
+      tasks: p.tasks.map((t) => {
+        if (t.id !== taskId) return t;
+        const has = (t.predecessors || []).some((pr) => pr.id === predId);
+        return {
+          ...t,
+          predecessors: has
+            ? t.predecessors.filter((pr) => pr.id !== predId)
+            : [...(t.predecessors || []), { id: predId, type: "FS", lag: 0 }],
+        };
+      }),
+    }));
+  };
+
+  const updateDependency = (taskId, predId, patch) => {
+    setProject((p) => ({
+      ...p,
+      tasks: p.tasks.map((t) => {
+        if (t.id !== taskId) return t;
+        return {
+          ...t,
+          predecessors: (t.predecessors || []).map((pr) => (pr.id === predId ? { ...pr, ...patch } : pr)),
+        };
+      }),
+    }));
+  };
+
+  const addActionItem = () => {
+    setProject((p) => {
+      const today = toISO(new Date());
+      return {
+        ...p,
+        actionItems: [
+          ...(p.actionItems || []),
+          { id: genActionId(), title: "New action item", owner: "", dueDate: today, originalDueDate: today, priority: "Medium", status: "Open", comments: [] },
+        ],
+      };
+    });
+  };
+
+  const updateActionItem = (id, patch) => {
+    setProject((p) => ({
+      ...p,
+      actionItems: (p.actionItems || []).map((a) => (a.id === id ? { ...a, ...patch } : a)),
+    }));
+  };
+
+  const removeActionItem = (id) => {
+    setProject((p) => ({ ...p, actionItems: (p.actionItems || []).filter((a) => a.id !== id) }));
+  };
+
+  const addRaidItem = (type = "Risk") => {
+    setProject((p) => {
+      const today = toISO(new Date());
+      return {
+        ...p,
+        raidLog: [
+          ...(p.raidLog || []),
+          {
+            id: genRaidId(),
+            type,
+            description: "New item",
+            owner: "",
+            impact: "Medium",
+            likelihood: type === "Risk" ? "Medium" : "-",
+            status: "Open",
+            dateRaised: today,
+            eta: toISO(addWorkdays(new Date(), 5)),
+            responseStrategy: "Mitigate",
+            responses: [],
+          },
+        ],
+      };
+    });
+  };
+
+  const updateRaidItem = (id, patch) => {
+    setProject((p) => ({
+      ...p,
+      raidLog: (p.raidLog || []).map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    }));
+  };
+
+  const removeRaidItem = (id) => {
+    setProject((p) => ({ ...p, raidLog: (p.raidLog || []).filter((r) => r.id !== id) }));
+  };
+
+  const addRaidResponse = (itemId, text) => {
+    setProject((p) => ({
+      ...p,
+      raidLog: (p.raidLog || []).map((r) =>
+        r.id === itemId ? { ...r, responses: [...(r.responses || []), { id: genNoteId(), text, date: toISO(new Date()) }] } : r
+      ),
+    }));
+  };
+
+  const removeRaidResponse = (itemId, responseId) => {
+    setProject((p) => ({
+      ...p,
+      raidLog: (p.raidLog || []).map((r) =>
+        r.id === itemId ? { ...r, responses: (r.responses || []).filter((resp) => resp.id !== responseId) } : r
+      ),
+    }));
+  };
+
+  const addActionComment = (itemId, text) => {
+    setProject((p) => ({
+      ...p,
+      actionItems: (p.actionItems || []).map((a) =>
+        a.id === itemId ? { ...a, comments: [...(a.comments || []), { id: genNoteId(), text, date: toISO(new Date()) }] } : a
+      ),
+    }));
+  };
+
+  const removeActionComment = (itemId, commentId) => {
+    setProject((p) => ({
+      ...p,
+      actionItems: (p.actionItems || []).map((a) =>
+        a.id === itemId ? { ...a, comments: (a.comments || []).filter((c) => c.id !== commentId) } : a
+      ),
+    }));
+  };
+
+  const showFlash = (msg) => {
+    setFlash(msg);
+    setTimeout(() => setFlash(""), 2500);
+  };
+
+  // Native File menu (Electron only — window.desktop is undefined in a plain browser).
+  useEffect(() => {
+    if (!window.desktop?.onMenuAction) return;
+    const off = window.desktop.onMenuAction(async (action) => {
+      if (action === "new") {
+        setProject(sampleProject());
+        showFlash("Started a new project");
+      } else if (action === "save-json") {
+        const res = await exportJSON(project);
+        if (!res.canceled) showFlash("Saved");
+      } else if (action === "save-csv") {
+        const res = await exportCSV(project.tasks, wbsById, effective, projectStart);
+        if (!res.canceled) showFlash("Saved");
+      } else if (action === "save-xml") {
+        const res = await exportXML(project);
+        if (!res.canceled) showFlash("Saved");
+      } else if (action === "open") {
+        const res = await window.desktop.openFile({
+          filters: [
+            { name: "Project Files", extensions: ["json", "xml"] },
+            { name: "All Files", extensions: ["*"] },
+          ],
+        });
+        if (res.canceled) return;
+        try {
+          const data = res.filePath.endsWith(".xml")
+            ? parseImportedXML(res.content)
+            : parseImportedJSON(res.content);
+          setProject(data);
+          setImportError("");
+          showFlash(`Opened "${data.name}"`);
+        } catch (err) {
+          setImportError(err.message || "Could not open that file");
+        }
+      }
+    });
+    return off;
+  }, [project, wbsById, effective, projectStart]);
+
+  /* ---------- mutation helpers ---------- */
+  const updateTask = useCallback((id, patch) => {
+    setProject((p) => ({
+      ...p,
+      tasks: p.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)),
+    }));
+  }, []);
+
+  const addTask = () => {
+    setProject((p) => ({
+      ...p,
+      tasks: [
+        ...p.tasks,
+        { id: genId(), name: "New Task", duration: 1, milestone: false, predecessors: [], resources: [] },
+      ],
+    }));
+  };
+
+  const removeTask = (id) => {
+    setProject((p) => ({
+      ...p,
+      tasks: p.tasks
+        .filter((t) => t.id !== id)
+        .map((t) => ({
+          ...t,
+          predecessors: (t.predecessors || []).filter((pr) => pr.id !== id),
+        })),
+    }));
+  };
+
+  const addResource = () => {
+    setProject((p) => ({
+      ...p,
+      resources: [...p.resources, { id: genResId(), name: "New Resource", rate: 50, maxUnits: 100 }],
+    }));
+  };
+
+  const updateResource = (id, patch) => {
+    setProject((p) => ({
+      ...p,
+      resources: p.resources.map((r) => (r.id === id ? { ...r, ...patch } : r)),
+    }));
+  };
+
+  const removeResource = (id) => {
+    setProject((p) => ({
+      ...p,
+      resources: p.resources.filter((r) => r.id !== id),
+      tasks: p.tasks.map((t) => ({
+        ...t,
+        resources: (t.resources || []).filter((a) => a.resourceId !== id),
+      })),
+    }));
+  };
+
+  const toggleTaskResource = (taskId, resourceId) => {
+    setProject((p) => ({
+      ...p,
+      tasks: p.tasks.map((t) => {
+        if (t.id !== taskId) return t;
+        const has = (t.resources || []).some((a) => a.resourceId === resourceId);
+        return {
+          ...t,
+          resources: has
+            ? t.resources.filter((a) => a.resourceId !== resourceId)
+            : [...(t.resources || []), { resourceId, units: 100 }],
+        };
+      }),
+    }));
+  };
+
+  /* ---------- import / export ---------- */
+  const handleImportFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        let data;
+        if (file.name.endsWith(".json")) data = parseImportedJSON(reader.result);
+        else if (file.name.endsWith(".xml")) data = parseImportedXML(reader.result);
+        else throw new Error("Use a .json or .xml file exported from this app");
+        setProject(data);
+        setImportError("");
+        showFlash(`Imported "${data.name}"`);
+      } catch (err) {
+        setImportError(err.message || "Could not import that file");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  /* ---------- scroll sync ---------- */
+  const onTableScroll = () => {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    if (ganttScrollRef.current) ganttScrollRef.current.scrollTop = tableScrollRef.current.scrollTop;
+    syncingRef.current = false;
+  };
+  const onGanttScroll = () => {
+    if (syncingRef.current) return;
+    syncingRef.current = true;
+    if (tableScrollRef.current) tableScrollRef.current.scrollTop = ganttScrollRef.current.scrollTop;
+    syncingRef.current = false;
+  };
+
+  /* ---------- derived: day columns for header ---------- */
+  const dayCols = useMemo(() => {
+    const cols = [];
+    for (let i = 0; i < totalSpan; i++) {
+      const d = dayIndexToDate(projectStart, i);
+      cols.push(d);
+    }
+    return cols;
+  }, [projectStart, totalSpan]);
+
+  const today = new Date();
+  const todayOffset = useMemo(() => {
+    let d = new Date(projectStart);
+    let count = 0;
+    if (today < d) return null;
+    while (toISO(d) !== toISO(today) && count < 2000) {
+      d.setDate(d.getDate() + 1);
+      if (!isWeekend(d)) count++;
+      if (toISO(d) === toISO(today)) break;
+    }
+    return count;
+  }, [projectStart]);
+
+  return (
+    <div
+      style={{
+        fontFamily: "ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+        height: "100vh",
+        width: "100%",
+      }}
+      className="flex flex-col"
+    >
+      <style>{`
+        html, body, #root { height: 100%; margin: 0; padding: 0; }
+        .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+        input[type="text"], input[type="number"] { outline: none; }
+        input[type="text"]:focus, input[type="number"]:focus { box-shadow: 0 0 0 2px ${COLORS.primary}33; border-radius: 4px; }
+        ::-webkit-scrollbar { height: 10px; width: 10px; }
+        ::-webkit-scrollbar-thumb { background: #C7CEDA; border-radius: 6px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+      `}</style>
+
+      {/* ============ HEADER ============ */}
+      <div style={{ background: COLORS.primaryDark }} className="text-white px-5 py-3 flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-2">
+          <Gauge size={20} />
+          <input
+            className="bg-transparent font-semibold text-lg border-b border-white/0 focus:border-white/40 px-0.5"
+            value={project.name}
+            onChange={(e) => setProject((p) => ({ ...p, name: e.target.value }))}
+            style={{ minWidth: 120 }}
+          />
+        </div>
+
+        <div className="flex items-center gap-1 text-sm text-white/80">
+          <CalendarDays size={14} />
+          <span>Start</span>
+          <input
+            type="date"
+            className="bg-white/10 rounded px-1.5 py-0.5 text-white text-sm"
+            value={project.projectStart}
+            onChange={(e) => setProject((p) => ({ ...p, projectStart: e.target.value }))}
+          />
+        </div>
+
+        <div className="flex-1" />
+
+        <div className="hidden md:flex items-center gap-4 text-sm text-white/85 mr-2">
+          <div>
+            <span className="text-white/55">Duration</span>{" "}
+            <b className="mono">{Math.round(projectDuration)}d</b>
+          </div>
+          <div>
+            <span className="text-white/55">Finish</span>{" "}
+            <b className="mono">{fmtShort(dayIndexToDate(projectStart, projectDuration))}</b>
+          </div>
+          <div>
+            <span className="text-white/55">Cost</span>{" "}
+            <b className="mono">${cost.total.toLocaleString(undefined, { maximumFractionDigits: 0 })}</b>
+          </div>
+          <div>
+            <span className="text-white/55">Critical</span>{" "}
+            <b className="mono" style={{ color: "#FF8A80" }}>{criticalCount}</b>
+          </div>
+          {overallocations.length > 0 && (
+            <div className="flex items-center gap-1" style={{ color: "#FFD479" }}>
+              <AlertTriangle size={14} />
+              <b>{new Set(overallocations.map((o) => o.resourceId)).size} overallocated</b>
+            </div>
+          )}
+        </div>
+
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setDayW((w) => Math.max(MIN_DAY_W, w - 4))}
+            className="p-1.5 rounded hover:bg-white/10"
+            title="Zoom out"
+          >
+            <ZoomOut size={16} />
+          </button>
+          <button
+            onClick={() => setDayW((w) => Math.min(MAX_DAY_W, w + 4))}
+            className="p-1.5 rounded hover:bg-white/10"
+            title="Zoom in"
+          >
+            <ZoomIn size={16} />
+          </button>
+        </div>
+      </div>
+
+      {/* ============ TOOLBAR ============ */}
+      <div className="bg-white border-b border-gray-200 px-4 py-2 flex items-center gap-2 flex-wrap">
+        <div className="flex bg-gray-100 rounded-lg p-0.5 mr-2">
+          <button
+            onClick={() => setTab("schedule")}
+            className={`px-3 py-1.5 text-sm rounded-md font-medium ${tab === "schedule" ? "bg-white shadow-sm" : "text-gray-500"}`}
+            style={tab === "schedule" ? { color: COLORS.primaryDark } : {}}
+          >
+            Schedule
+          </button>
+          <button
+            onClick={() => setTab("resources")}
+            className={`px-3 py-1.5 text-sm rounded-md font-medium ${tab === "resources" ? "bg-white shadow-sm" : "text-gray-500"}`}
+            style={tab === "resources" ? { color: COLORS.primaryDark } : {}}
+          >
+            Resources
+          </button>
+          <button
+            onClick={() => setTab("actions")}
+            className={`px-3 py-1.5 text-sm rounded-md font-medium flex items-center gap-1 ${tab === "actions" ? "bg-white shadow-sm" : "text-gray-500"}`}
+            style={tab === "actions" ? { color: COLORS.primaryDark } : {}}
+          >
+            Action Items
+            {(project.actionItems || []).filter((a) => a.status !== "Done").length > 0 && (
+              <span
+                className="text-[10px] rounded-full px-1.5 text-white font-semibold"
+                style={{ background: tab === "actions" ? COLORS.primary : "#9AA5B1" }}
+              >
+                {(project.actionItems || []).filter((a) => a.status !== "Done").length}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setTab("raid")}
+            className={`px-3 py-1.5 text-sm rounded-md font-medium flex items-center gap-1 ${tab === "raid" ? "bg-white shadow-sm" : "text-gray-500"}`}
+            style={tab === "raid" ? { color: COLORS.primaryDark } : {}}
+          >
+            RAID Log
+            {(project.raidLog || []).filter((r) => r.status === "Open").length > 0 && (
+              <span
+                className="text-[10px] rounded-full px-1.5 text-white font-semibold"
+                style={{ background: tab === "raid" ? COLORS.primary : "#9AA5B1" }}
+              >
+                {(project.raidLog || []).filter((r) => r.status === "Open").length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        <button
+          onClick={addTask}
+          className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md text-white font-medium"
+          style={{ background: COLORS.primary }}
+        >
+          <Plus size={15} /> Task
+        </button>
+
+        <button
+          onClick={() => setLeveled((v) => !v)}
+          className={`flex items-center gap-1 text-sm px-3 py-1.5 rounded-md font-medium border ${
+            leveled ? "text-white" : "text-gray-600 border-gray-300"
+          }`}
+          style={leveled ? { background: COLORS.milestone, borderColor: COLORS.milestone } : {}}
+          title="Delay non-critical tasks within their float to resolve overallocation (best-effort)"
+        >
+          Level Resources {leveled ? "✓" : ""}
+        </button>
+
+        <div className="flex-1" />
+
+        <div className="relative group">
+          <button className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md border border-gray-300 text-gray-600">
+            <Download size={14} /> Export <ChevronDown size={13} />
+          </button>
+          <div className="absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg hidden group-hover:block z-30 w-56">
+            <button onClick={() => exportJSON(project)} className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50">
+              JSON (full project)
+            </button>
+            <button onClick={() => exportCSV(project.tasks, wbsById, effective, projectStart)} className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50">
+              CSV (task list)
+            </button>
+            <button onClick={() => exportXML(project)} className="w-full text-left px-3 py-2 text-sm hover:bg-gray-50 border-t border-gray-100">
+              Project XML (interchange)
+            </button>
+          </div>
+        </div>
+
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1 text-sm px-3 py-1.5 rounded-md border border-gray-300 text-gray-600"
+        >
+          <Upload size={14} /> Import
+        </button>
+        <input ref={fileInputRef} type="file" accept=".json,.xml" className="hidden" onChange={handleImportFile} />
+      </div>
+
+      {(hasCycle || importError || flash || (leveled && unresolved.length > 0)) && (
+        <div className="px-4 py-1.5 text-sm border-b" style={{ background: "#FFF6E9", borderColor: "#F3DFB8" }}>
+          {hasCycle && (
+            <span className="text-amber-800 flex items-center gap-1">
+              <AlertTriangle size={14} /> Circular dependency detected — dates shown may be unreliable until it's fixed.
+            </span>
+          )}
+          {importError && <span className="text-red-700">{importError}</span>}
+          {flash && <span className="text-emerald-700">{flash}</span>}
+          {leveled && unresolved.length > 0 && (
+            <span className="text-amber-800">
+              {" "}
+              {unresolved.length} task(s) still overallocated after leveling (not enough float to fully resolve).
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* ============ BODY ============ */}
+      {tab === "schedule" && (
+        <div className="flex items-center gap-4 px-4 py-1.5 text-[11px] text-gray-500 bg-white border-b border-gray-100">
+          <span className="flex items-center gap-1">
+            <span style={{ width: 10, height: 10, background: COLORS.critical, borderRadius: 2 }} /> Critical path
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ width: 10, height: 10, background: COLORS.primary, borderRadius: 2 }} /> Normal task
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ width: 8, height: 8, background: COLORS.milestone, transform: "rotate(45deg)" }} /> Milestone
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ width: 14, height: 0, borderTop: "1.5px solid #B7C0CC" }} /> Dependency
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ width: 10, height: 10, border: "2px solid " + COLORS.milestone, borderRadius: 2 }} /> Revised date (dashed = original)
+          </span>
+          <span className="flex items-center gap-1">
+            <span style={{ width: 2, height: 10, background: COLORS.today }} /> Today
+          </span>
+        </div>
+      )}
+      {tab === "schedule" ? (
+        <div className="flex-1 flex overflow-hidden" style={{ background: COLORS.canvas }}>
+          {/* TASK TABLE */}
+          <div className="flex flex-col border-r border-gray-200 bg-white" style={{ width: 660, flexShrink: 0 }}>
+            <div
+              className="flex text-xs font-semibold text-gray-500 border-b border-gray-200 bg-gray-50 sticky top-0"
+              style={{ height: HEADER_H, alignItems: "center" }}
+            >
+              <div style={{ width: 30 }} className="px-2">#</div>
+              <div style={{ width: 156 }} className="px-2">Name</div>
+              <div style={{ width: 46 }} className="px-1 text-center">Dur</div>
+              <div style={{ width: 88 }} className="px-1">Predecessors</div>
+              <div style={{ width: 96 }} className="px-1">Start</div>
+              <div style={{ width: 96 }} className="px-1">Finish</div>
+              <div style={{ width: 48 }} className="px-1 text-center">Float</div>
+              <div style={{ width: 30 }} />
+            </div>
+            <div ref={tableScrollRef} onScroll={onTableScroll} className="overflow-y-auto overflow-x-hidden flex-1">
+              {project.tasks.map((t, i) => {
+                const sch = schedule[t.id] || {};
+                const delay = delays[t.id] || 0;
+                const computedStart = dayIndexToDate(projectStart, sch.es + delay);
+                const computedFinish = dayIndexToDate(projectStart, sch.ef + delay);
+                return (
+                  <div
+                    key={t.id}
+                    className="flex items-center border-b border-gray-100 text-sm"
+                    style={{ height: ROW_H, background: sch.critical ? "#FDF1F0" : "white" }}
+                  >
+                    <div style={{ width: 30 }} className="px-2 text-gray-400 mono text-xs">{i + 1}</div>
+                    <div style={{ width: 156 }} className="px-2 truncate flex items-center gap-1">
+                      {t.milestone && <Diamond size={10} fill={COLORS.milestone} color={COLORS.milestone} />}
+                      <input
+                        className="w-full bg-transparent text-sm"
+                        value={t.name}
+                        onChange={(e) => updateTask(t.id, { name: e.target.value })}
+                      />
+                    </div>
+                    <div style={{ width: 46 }} className="px-1">
+                      <input
+                        type="number"
+                        min={0}
+                        disabled={t.milestone}
+                        className="w-full bg-transparent text-sm text-center mono disabled:text-gray-300"
+                        value={t.duration}
+                        onChange={(e) => updateTask(t.id, { duration: Math.max(0, parseFloat(e.target.value) || 0) })}
+                      />
+                    </div>
+                    <div style={{ width: 88 }} className="px-1 flex items-center gap-0.5">
+                      <input
+                        className="w-full bg-transparent text-sm mono"
+                        defaultValue={formatPredecessors(t.predecessors, wbsById)}
+                        key={formatPredecessors(t.predecessors, wbsById)}
+                        onBlur={(e) => {
+                          const idByWbs = new Map(project.tasks.map((tt, idx) => [String(idx + 1), tt.id]));
+                          const raw = e.target.value
+                            .split(",")
+                            .map((s) => s.trim())
+                            .filter(Boolean)
+                            .map((tok) => {
+                              const m = tok.match(/^(\d+)\s*(FS|SS|FF|SF)?\s*([+-]\d+)?$/i);
+                              if (!m) return null;
+                              const realId = idByWbs.get(m[1]);
+                              if (!realId) return null;
+                              return { id: realId, type: (m[2] || "FS").toUpperCase(), lag: m[3] ? parseInt(m[3], 10) : 0 };
+                            })
+                            .filter(Boolean);
+                          updateTask(t.id, { predecessors: raw });
+                        }}
+                        placeholder="e.g. 2FS+1"
+                        title='Type IDs directly, e.g. "2FS+1", or use the link icon to pick from a list'
+                      />
+                      <button
+                        onClick={(e) => openDependencyEditor(e, t.id)}
+                        className="text-gray-300 hover:text-gray-600 shrink-0"
+                        title="Add / edit dependencies"
+                      >
+                        <Link2 size={12} />
+                      </button>
+                    </div>
+                    <div style={{ width: 96 }} className="px-1">
+                      <DateCell
+                        computedDate={computedStart}
+                        overrideISO={t.overrideStart}
+                        onChange={(iso) => updateTask(t.id, { overrideStart: iso })}
+                        onClear={() => updateTask(t.id, { overrideStart: null })}
+                      />
+                    </div>
+                    <div style={{ width: 96 }} className="px-1">
+                      <DateCell
+                        computedDate={computedFinish}
+                        overrideISO={t.overrideFinish}
+                        onChange={(iso) => updateTask(t.id, { overrideFinish: iso })}
+                        onClear={() => updateTask(t.id, { overrideFinish: null })}
+                      />
+                    </div>
+                    <div
+                      style={{ width: 48, color: sch.critical ? COLORS.critical : COLORS.sub }}
+                      className="px-1 text-center text-xs mono"
+                    >
+                      {Math.round(sch.float ?? 0)}d
+                    </div>
+                    <div style={{ width: 30 }} className="px-1">
+                      <button onClick={() => removeTask(t.id)} className="text-gray-300 hover:text-red-500">
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+              {project.tasks.length === 0 && (
+                <div className="p-6 text-center text-sm text-gray-400">No tasks yet. Click "Task" to add one.</div>
+              )}
+            </div>
+
+            <label className="flex items-center gap-2 px-3 py-2 border-t border-gray-100 text-xs text-gray-500">
+              <input type="checkbox" onChange={() => {}} disabled /> Milestones toggle inline per row (0-day tasks)
+            </label>
+          </div>
+
+          {/* GANTT */}
+          <div className="flex-1 overflow-hidden flex flex-col relative">
+            {/* header */}
+            <div
+              className="flex border-b border-gray-200 bg-gray-50 sticky top-0 z-10 overflow-hidden"
+              style={{ height: HEADER_H }}
+            >
+              <div style={{ width: totalSpan * dayW, position: "relative" }}>
+                {dayCols.map((d, i) => (
+                  <div
+                    key={i}
+                    className="absolute top-0 h-full flex flex-col items-center justify-center text-[10px] text-gray-500 border-r"
+                    style={{
+                      left: i * dayW,
+                      width: dayW,
+                      borderColor: COLORS.grid,
+                      background: isWeekend(d) ? COLORS.weekend : "transparent",
+                    }}
+                  >
+                    {(i === 0 || d.getDate() === 1 || dayW >= 20) && (
+                      <>
+                        <span className="font-semibold" style={{ fontSize: 9 }}>
+                          {d.toLocaleDateString(undefined, { month: "short" })}
+                        </span>
+                        <span>{d.getDate()}</span>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div ref={ganttScrollRef} onScroll={onGanttScroll} className="flex-1 overflow-auto relative">
+              <div style={{ width: totalSpan * dayW, height: project.tasks.length * ROW_H, position: "relative" }}>
+                {/* weekend + grid background */}
+                {dayCols.map((d, i) => (
+                  <div
+                    key={i}
+                    className="absolute top-0 bottom-0 border-r"
+                    style={{
+                      left: i * dayW,
+                      width: dayW,
+                      borderColor: COLORS.grid,
+                      background: isWeekend(d) ? COLORS.weekend : "transparent",
+                    }}
+                  />
+                ))}
+                {/* today line */}
+                {todayOffset !== null && todayOffset >= 0 && todayOffset < totalSpan && (
+                  <div
+                    className="absolute top-0 bottom-0 w-0.5 z-20"
+                    style={{ left: todayOffset * dayW, background: COLORS.today }}
+                  />
+                )}
+                {/* row bg stripes */}
+                {project.tasks.map((t, i) => (
+                  <div
+                    key={t.id}
+                    className="absolute left-0 right-0"
+                    style={{ top: i * ROW_H, height: ROW_H, borderBottom: `1px solid ${COLORS.grid}` }}
+                  />
+                ))}
+
+                {/* dependency arrows */}
+                <svg
+                  className="absolute top-0 left-0 pointer-events-none"
+                  width={totalSpan * dayW}
+                  height={project.tasks.length * ROW_H}
+                  style={{ zIndex: 5 }}
+                >
+                  {project.tasks.map((t, i) => {
+                    const eff = effective[t.id];
+                    if (!eff) return null;
+                    return (t.predecessors || []).map((p, pi) => {
+                      const predIdx = project.tasks.findIndex((tt) => tt.id === p.id);
+                      const predEff = effective[p.id];
+                      const predSch = schedule[p.id];
+                      const sch = schedule[t.id];
+                      if (predIdx === -1 || !predEff) return null;
+                      const bothCritical = sch?.critical && predSch?.critical;
+                      const predEndX = predEff.ef * dayW;
+                      const myStartX = eff.es * dayW;
+                      const predY = predIdx * ROW_H + ROW_H / 2;
+                      const myY = i * ROW_H + ROW_H / 2;
+                      const midX = predEndX + Math.min(10, Math.max(4, myStartX - predEndX));
+                      const path = `M ${predEndX} ${predY} L ${midX} ${predY} L ${midX} ${myY} L ${myStartX} ${myY}`;
+                      return (
+                        <path
+                          key={`${t.id}-${pi}`}
+                          d={path}
+                          fill="none"
+                          stroke={bothCritical ? COLORS.critical : "#B7C0CC"}
+                          strokeWidth={bothCritical ? 1.6 : 1.2}
+                          markerEnd="url(#arrow)"
+                        />
+                      );
+                    });
+                  })}
+                  <defs>
+                    <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+                      <path d="M0,0 L6,3 L0,6 Z" fill="#B7C0CC" />
+                    </marker>
+                  </defs>
+                </svg>
+
+                {/* task bars */}
+                {project.tasks.map((t, i) => {
+                  const sch = schedule[t.id];
+                  const eff = effective[t.id];
+                  if (!sch || !eff) return null;
+                  const x = eff.es * dayW;
+                  const w = Math.max(dayW * 0.5, (eff.ef - eff.es) * dayW);
+                  const barColor = sch.critical ? COLORS.critical : COLORS.primary;
+                  const effStartDate = dayIndexToDate(projectStart, eff.es);
+                  const effFinishDate = dayIndexToDate(projectStart, eff.ef);
+
+                  if (t.milestone) {
+                    return (
+                      <div
+                        key={t.id}
+                        className="absolute flex items-center justify-center"
+                        style={{ left: x - 6, top: i * ROW_H + ROW_H / 2 - 6, width: 12, height: 12, zIndex: 10 }}
+                        title={`${t.name} — ${fmtDate(effStartDate)}`}
+                      >
+                        <div style={{ width: 12, height: 12, background: COLORS.milestone, transform: "rotate(45deg)" }} />
+                      </div>
+                    );
+                  }
+                  return (
+                    <React.Fragment key={t.id}>
+                      {eff.overridden && (
+                        <div
+                          className="absolute rounded border border-dashed"
+                          style={{
+                            left: eff.baseEs * dayW,
+                            top: i * ROW_H + 6,
+                            width: Math.max(dayW * 0.5, (eff.baseEf - eff.baseEs) * dayW),
+                            height: ROW_H - 12,
+                            borderColor: "#B9C2CC",
+                            background: "transparent",
+                            zIndex: 8,
+                          }}
+                          title="Originally computed dates (before revision)"
+                        />
+                      )}
+                      <div
+                        className="absolute rounded flex items-center px-1.5 text-[11px] text-white font-medium overflow-hidden shadow-sm"
+                        style={{
+                          left: x,
+                          top: i * ROW_H + 6,
+                          width: w,
+                          height: ROW_H - 12,
+                          background: barColor,
+                          zIndex: 10,
+                          outline: eff.overridden ? `2px solid ${COLORS.milestone}` : "none",
+                          outlineOffset: 1,
+                        }}
+                        title={`${t.name}\n${fmtDate(effStartDate)} → ${fmtDate(effFinishDate)}\nFloat: ${Math.round(sch.float)}d${
+                          eff.overridden ? "\n(revised date)" : ""
+                        }`}
+                      >
+                        <span className="truncate">{t.name}</span>
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : tab === "resources" ? (
+        <ResourcesTab
+          project={project}
+          load={load}
+          overallocations={overallocations}
+          cost={cost}
+          addResource={addResource}
+          updateResource={updateResource}
+          removeResource={removeResource}
+          toggleTaskResource={toggleTaskResource}
+          wbsById={wbsById}
+          selectedResourceId={selectedResourceId}
+          setSelectedResourceId={setSelectedResourceId}
+          projectStart={projectStart}
+          projectDuration={projectDuration}
+        />
+      ) : tab === "actions" ? (
+        <ActionItemsTab
+          actionItems={project.actionItems || []}
+          addActionItem={addActionItem}
+          updateActionItem={updateActionItem}
+          removeActionItem={removeActionItem}
+          addActionComment={addActionComment}
+          removeActionComment={removeActionComment}
+        />
+      ) : (
+        <RaidLogTab
+          raidLog={project.raidLog || []}
+          addRaidItem={addRaidItem}
+          updateRaidItem={updateRaidItem}
+          removeRaidItem={removeRaidItem}
+          addRaidResponse={addRaidResponse}
+          removeRaidResponse={removeRaidResponse}
+        />
+      )}
+
+      {/* ============ DEPENDENCY PICKER POPOVER ============ */}
+      {depEditor && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setDepEditor(null)} />
+          <div
+            className="fixed bg-white border border-gray-200 rounded-lg shadow-xl z-50 w-72"
+            style={{ top: depEditor.top, left: depEditor.left }}
+          >
+            <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100">
+              <span className="text-xs font-semibold text-gray-600">Dependencies</span>
+              <button onClick={() => setDepEditor(null)} className="text-gray-300 hover:text-gray-600">
+                <X size={13} />
+              </button>
+            </div>
+            <div className="max-h-72 overflow-y-auto py-1">
+              {project.tasks
+                .filter((tt) => tt.id !== depEditor.taskId)
+                .map((tt) => {
+                  const task = project.tasks.find((x) => x.id === depEditor.taskId);
+                  const existing = (task?.predecessors || []).find((p) => p.id === tt.id);
+                  return (
+                    <div key={tt.id} className="flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-gray-50">
+                      <input
+                        type="checkbox"
+                        checked={!!existing}
+                        onChange={() => toggleDependency(depEditor.taskId, tt.id)}
+                      />
+                      <span className="flex-1 truncate">
+                        {wbsById.get(tt.id)}. {tt.name}
+                      </span>
+                      {existing && (
+                        <>
+                          <select
+                            value={existing.type}
+                            onChange={(e) => updateDependency(depEditor.taskId, tt.id, { type: e.target.value })}
+                            className="text-[10px] border border-gray-200 rounded px-0.5"
+                          >
+                            {REL_TYPES.map((rt) => (
+                              <option key={rt} value={rt}>
+                                {rt}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            type="number"
+                            value={existing.lag}
+                            onChange={(e) =>
+                              updateDependency(depEditor.taskId, tt.id, { lag: parseInt(e.target.value, 10) || 0 })
+                            }
+                            className="w-10 text-[10px] border border-gray-200 rounded mono px-0.5"
+                            title="Lag (days)"
+                          />
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              {project.tasks.length <= 1 && (
+                <div className="px-3 py-3 text-xs text-gray-400">Add more tasks to link dependencies.</div>
+              )}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* =========================================================================
+   NOTES LIST — small reusable comment/response thread used by both the
+   Action Items tab (comments) and the RAID Log tab (risk responses).
+========================================================================= */
+function NotesList({ items, onAdd, onRemove, placeholder }) {
+  const [text, setText] = useState("");
+  const submit = () => {
+    if (!text.trim()) return;
+    onAdd(text.trim());
+    setText("");
+  };
+  return (
+    <div className="mt-1.5 space-y-1">
+      {items.map((n) => (
+        <div key={n.id} className="flex items-start gap-2 text-xs text-gray-600 bg-gray-50 rounded px-2 py-1">
+          <span className="mono text-gray-400 shrink-0">{fmtShort(new Date(n.date + "T00:00:00"))}</span>
+          <span className="flex-1">{n.text}</span>
+          <button onClick={() => onRemove(n.id)} className="text-gray-300 hover:text-red-500 shrink-0">
+            <X size={10} />
+          </button>
+        </div>
+      ))}
+      {items.length === 0 && <div className="text-xs text-gray-300 italic">Nothing logged yet.</div>}
+      <div className="flex items-center gap-1.5 pt-0.5">
+        <input
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") submit();
+          }}
+          placeholder={placeholder}
+          className="flex-1 text-xs border border-gray-200 rounded px-2 py-1"
+        />
+        <button onClick={submit} className="text-xs px-2 py-1 rounded border border-gray-200 text-gray-500 hover:bg-gray-50 shrink-0">
+          Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   ACTION ITEMS TAB
+========================================================================= */
+const STATUS_STYLES = {
+  Open: { bg: "#EEF2F6", color: "#475569" },
+  "In Progress": { bg: "#E5F0FA", color: "#1D6FA5" },
+  Blocked: { bg: "#FBE9E7", color: COLORS.critical },
+  Done: { bg: "#E7F5EE", color: "#227A53" },
+};
+const PRIORITY_STYLES = {
+  Low: "#8CA0B3",
+  Medium: "#D9A441",
+  High: COLORS.critical,
+};
+
+function ActionItemsTab({ actionItems, addActionItem, updateActionItem, removeActionItem, addActionComment, removeActionComment }) {
+  const [filter, setFilter] = useState("All");
+  const [expandedId, setExpandedId] = useState(null);
+  const visible = filter === "All" ? actionItems : actionItems.filter((a) => a.status === filter);
+  const openCount = actionItems.filter((a) => a.status !== "Done").length;
+
+  return (
+    <div className="flex-1 overflow-y-auto p-5" style={{ background: COLORS.canvas }}>
+      <div className="bg-white rounded-lg border border-gray-200 max-w-4xl mx-auto">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+          <div className="flex items-center gap-2 font-semibold text-sm" style={{ color: COLORS.primaryDark }}>
+            <ListChecks size={16} /> Action Items
+            <span className="text-xs font-normal text-gray-400">({openCount} open)</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="text-xs border border-gray-200 rounded px-2 py-1 text-gray-600"
+            >
+              {["All", "Open", "In Progress", "Blocked", "Done"].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <button
+              onClick={addActionItem}
+              className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md text-white font-medium"
+              style={{ background: COLORS.primary }}
+            >
+              <Plus size={13} /> Add
+            </button>
+          </div>
+        </div>
+
+        <div
+          className="flex text-[11px] font-semibold text-gray-400 px-4 py-2 border-b border-gray-100"
+        >
+          <div style={{ width: 22 }} />
+          <div style={{ width: "33%" }}>Item</div>
+          <div style={{ width: "15%" }}>Owner</div>
+          <div style={{ width: "15%" }}>Due</div>
+          <div style={{ width: "11%" }}>Priority</div>
+          <div style={{ width: "13%" }}>Status</div>
+          <div style={{ width: 26 }} />
+        </div>
+
+        {visible.map((item) => {
+          const statusStyle = STATUS_STYLES[item.status] || STATUS_STYLES.Open;
+          const overdue = item.status !== "Done" && item.dueDate && new Date(item.dueDate) < new Date(toISO(new Date()));
+          const comments = item.comments || [];
+          const expanded = expandedId === item.id;
+          return (
+            <div key={item.id} className="border-b border-gray-50">
+              <div className="flex items-center px-4 py-2 text-sm">
+                <div style={{ width: 22 }}>
+                  <button
+                    onClick={() => setExpandedId(expanded ? null : item.id)}
+                    className="text-gray-300 hover:text-gray-600 flex items-center"
+                    title="Comments"
+                  >
+                    {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  </button>
+                </div>
+                <div style={{ width: "33%" }} className="pr-2">
+                  <input
+                    className="w-full bg-transparent"
+                    value={item.title}
+                    onChange={(e) => updateActionItem(item.id, { title: e.target.value })}
+                  />
+                </div>
+                <div style={{ width: "15%" }} className="pr-2">
+                  <input
+                    className="w-full bg-transparent text-xs text-gray-600"
+                    value={item.owner}
+                    placeholder="Unassigned"
+                    onChange={(e) => updateActionItem(item.id, { owner: e.target.value })}
+                  />
+                </div>
+                <div style={{ width: "15%" }} className="pr-2 flex items-center gap-1">
+                  <DateCell
+                    computedDate={new Date((item.originalDueDate || item.dueDate) + "T00:00:00")}
+                    overrideISO={item.dueDate !== (item.originalDueDate || item.dueDate) ? item.dueDate : null}
+                    onChange={(iso) => updateActionItem(item.id, { dueDate: iso })}
+                    onClear={() => updateActionItem(item.id, { dueDate: item.originalDueDate || item.dueDate })}
+                  />
+                  {overdue && <Flag size={11} color={COLORS.critical} />}
+                </div>
+                <div style={{ width: "11%" }} className="pr-2">
+                  <select
+                    value={item.priority}
+                    onChange={(e) => updateActionItem(item.id, { priority: e.target.value })}
+                    className="text-xs bg-transparent font-medium"
+                    style={{ color: PRIORITY_STYLES[item.priority] }}
+                  >
+                    <option>Low</option>
+                    <option>Medium</option>
+                    <option>High</option>
+                  </select>
+                </div>
+                <div style={{ width: "13%" }} className="pr-2">
+                  <select
+                    value={item.status}
+                    onChange={(e) => updateActionItem(item.id, { status: e.target.value })}
+                    className="text-[11px] font-medium rounded-full px-2 py-0.5 border-0"
+                    style={{ background: statusStyle.bg, color: statusStyle.color }}
+                  >
+                    <option>Open</option>
+                    <option>In Progress</option>
+                    <option>Blocked</option>
+                    <option>Done</option>
+                  </select>
+                </div>
+                <div style={{ width: 26 }}>
+                  <button onClick={() => removeActionItem(item.id)} className="text-gray-300 hover:text-red-500">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+              {!expanded && comments.length > 0 && (
+                <button
+                  onClick={() => setExpandedId(item.id)}
+                  className="flex items-center gap-1 text-[11px] text-gray-400 hover:text-gray-600 px-4 pb-2 -mt-1"
+                >
+                  <MessageSquare size={11} /> {comments.length} comment{comments.length > 1 ? "s" : ""}
+                </button>
+              )}
+              {expanded && (
+                <div className="px-4 pb-3 -mt-1 pl-[46px]">
+                  <div className="flex items-center gap-1 text-[11px] font-semibold text-gray-400 mb-1">
+                    <MessageSquare size={11} /> Comments
+                  </div>
+                  <NotesList
+                    items={comments}
+                    onAdd={(text) => addActionComment(item.id, text)}
+                    onRemove={(commentId) => removeActionComment(item.id, commentId)}
+                    placeholder="Add a comment..."
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {visible.length === 0 && (
+          <div className="p-8 text-center text-sm text-gray-400">
+            {actionItems.length === 0 ? 'No action items yet. Click "Add" to create one.' : "Nothing matches this filter."}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   RAID LOG TAB — Risks, Assumptions, Issues, Dependencies
+========================================================================= */
+const RAID_TYPE_STYLES = {
+  Risk: { bg: "#FBE9E7", color: COLORS.critical },
+  Assumption: { bg: "#E5F0FA", color: "#1D6FA5" },
+  Issue: { bg: "#FEF3E0", color: "#B4700A" },
+  Dependency: { bg: "#F1E9FB", color: "#7A4FC2" },
+};
+const RAID_IMPACT_COLOR = { Low: "#8CA0B3", Medium: "#D9A441", High: COLORS.critical, "-": "#C7CED6" };
+const RAID_STATUS_STYLES = {
+  Open: { bg: "#EEF2F6", color: "#475569" },
+  Mitigated: { bg: "#E5F0FA", color: "#1D6FA5" },
+  Realized: { bg: "#FBE9E7", color: COLORS.critical },
+  Closed: { bg: "#E7F5EE", color: "#227A53" },
+};
+
+const RAID_STRATEGIES = ["Avoid", "Mitigate", "Transfer", "Accept", "Escalate", "Monitor"];
+
+function RaidLogTab({ raidLog, addRaidItem, updateRaidItem, removeRaidItem, addRaidResponse, removeRaidResponse }) {
+  const [filter, setFilter] = useState("All");
+  const [expandedId, setExpandedId] = useState(null);
+  const visible = filter === "All" ? raidLog : raidLog.filter((r) => r.type === filter);
+
+  const counts = { Risk: 0, Assumption: 0, Issue: 0, Dependency: 0 };
+  raidLog.forEach((r) => {
+    if (counts[r.type] !== undefined) counts[r.type] += 1;
+  });
+
+  return (
+    <div className="flex-1 overflow-y-auto p-5" style={{ background: COLORS.canvas }}>
+      <div className="bg-white rounded-lg border border-gray-200 max-w-6xl mx-auto">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+          <div className="flex items-center gap-2 font-semibold text-sm" style={{ color: COLORS.primaryDark }}>
+            <AlertTriangle size={16} /> RAID Log
+            <span className="text-xs font-normal text-gray-400">
+              R:{counts.Risk} · A:{counts.Assumption} · I:{counts.Issue} · D:{counts.Dependency}
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <select
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              className="text-xs border border-gray-200 rounded px-2 py-1 text-gray-600"
+            >
+              {["All", "Risk", "Assumption", "Issue", "Dependency"].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+            <div className="relative group">
+              <button
+                className="flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-md text-white font-medium"
+                style={{ background: COLORS.primary }}
+              >
+                <Plus size={13} /> Add <ChevronDown size={12} />
+              </button>
+              <div className="absolute right-0 top-full mt-1 bg-white border border-gray-200 rounded-md shadow-lg hidden group-hover:block z-30 w-36">
+                {["Risk", "Assumption", "Issue", "Dependency"].map((t) => (
+                  <button
+                    key={t}
+                    onClick={() => addRaidItem(t)}
+                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-gray-50"
+                  >
+                    {t}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex text-[11px] font-semibold text-gray-400 px-4 py-2 border-b border-gray-100">
+          <div style={{ width: 20 }} />
+          <div style={{ width: "9%" }}>Type</div>
+          <div style={{ width: "18%" }}>Description</div>
+          <div style={{ width: "10%" }}>Owner</div>
+          <div style={{ width: "7%" }}>Impact</div>
+          <div style={{ width: "7%" }}>Likelihood</div>
+          <div style={{ width: "9%" }}>Strategy</div>
+          <div style={{ width: "9%" }}>Status</div>
+          <div style={{ width: "8%" }}>Raised</div>
+          <div style={{ width: "8%" }}>ETA</div>
+          <div style={{ width: 26 }} />
+        </div>
+
+        {visible.map((item) => {
+          const typeStyle = RAID_TYPE_STYLES[item.type] || RAID_TYPE_STYLES.Risk;
+          const statusStyle = RAID_STATUS_STYLES[item.status] || RAID_STATUS_STYLES.Open;
+          const responses = item.responses || [];
+          const etaOverdue =
+            item.status !== "Closed" &&
+            item.status !== "Realized" &&
+            item.eta &&
+            new Date(item.eta) < new Date(toISO(new Date()));
+          const expanded = expandedId === item.id;
+          return (
+            <div key={item.id} className="border-b border-gray-50">
+              <div className="flex items-center px-4 py-2 text-sm">
+                <div style={{ width: 20 }}>
+                  <button
+                    onClick={() => setExpandedId(expanded ? null : item.id)}
+                    className="text-gray-300 hover:text-gray-600 flex items-center"
+                    title="Risk responses"
+                  >
+                    {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                  </button>
+                </div>
+                <div style={{ width: "9%" }} className="pr-2">
+                  <select
+                    value={item.type}
+                    onChange={(e) =>
+                      updateRaidItem(item.id, {
+                        type: e.target.value,
+                        likelihood: e.target.value === "Risk" ? (item.likelihood === "-" ? "Medium" : item.likelihood) : "-",
+                      })
+                    }
+                    className="text-[11px] font-medium rounded-full px-2 py-0.5 border-0"
+                    style={{ background: typeStyle.bg, color: typeStyle.color }}
+                  >
+                    <option>Risk</option>
+                    <option>Assumption</option>
+                    <option>Issue</option>
+                    <option>Dependency</option>
+                  </select>
+                </div>
+                <div style={{ width: "18%" }} className="pr-2">
+                  <input
+                    className="w-full bg-transparent"
+                    value={item.description}
+                    onChange={(e) => updateRaidItem(item.id, { description: e.target.value })}
+                  />
+                </div>
+                <div style={{ width: "10%" }} className="pr-2">
+                  <input
+                    className="w-full bg-transparent text-xs text-gray-600"
+                    value={item.owner}
+                    placeholder="Unassigned"
+                    onChange={(e) => updateRaidItem(item.id, { owner: e.target.value })}
+                  />
+                </div>
+                <div style={{ width: "7%" }} className="pr-2">
+                  <select
+                    value={item.impact}
+                    onChange={(e) => updateRaidItem(item.id, { impact: e.target.value })}
+                    className="text-xs bg-transparent font-medium"
+                    style={{ color: RAID_IMPACT_COLOR[item.impact] }}
+                  >
+                    <option>Low</option>
+                    <option>Medium</option>
+                    <option>High</option>
+                  </select>
+                </div>
+                <div style={{ width: "7%" }} className="pr-2">
+                  {item.type === "Risk" ? (
+                    <select
+                      value={item.likelihood}
+                      onChange={(e) => updateRaidItem(item.id, { likelihood: e.target.value })}
+                      className="text-xs bg-transparent font-medium"
+                      style={{ color: RAID_IMPACT_COLOR[item.likelihood] }}
+                    >
+                      <option>Low</option>
+                      <option>Medium</option>
+                      <option>High</option>
+                    </select>
+                  ) : (
+                    <span className="text-xs text-gray-300">—</span>
+                  )}
+                </div>
+                <div style={{ width: "9%" }} className="pr-2">
+                  <select
+                    value={item.responseStrategy || "Mitigate"}
+                    onChange={(e) => updateRaidItem(item.id, { responseStrategy: e.target.value })}
+                    className="text-xs bg-transparent font-medium text-gray-600"
+                  >
+                    {RAID_STRATEGIES.map((s) => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div style={{ width: "9%" }} className="pr-2">
+                  <select
+                    value={item.status}
+                    onChange={(e) => updateRaidItem(item.id, { status: e.target.value })}
+                    className="text-[11px] font-medium rounded-full px-2 py-0.5 border-0"
+                    style={{ background: statusStyle.bg, color: statusStyle.color }}
+                  >
+                    <option>Open</option>
+                    <option>Mitigated</option>
+                    <option>Realized</option>
+                    <option>Closed</option>
+                  </select>
+                </div>
+                <div style={{ width: "8%" }} className="pr-2">
+                  <input
+                    type="date"
+                    className="w-full bg-transparent text-xs mono text-gray-600"
+                    value={item.dateRaised}
+                    onChange={(e) => updateRaidItem(item.id, { dateRaised: e.target.value })}
+                  />
+                </div>
+                <div style={{ width: "8%" }} className="pr-2 flex items-center gap-1">
+                  <input
+                    type="date"
+                    className={`w-full bg-transparent text-xs mono ${etaOverdue ? "font-semibold" : "text-gray-600"}`}
+                    style={etaOverdue ? { color: COLORS.critical } : {}}
+                    value={item.eta || ""}
+                    onChange={(e) => updateRaidItem(item.id, { eta: e.target.value })}
+                  />
+                  {etaOverdue && <Flag size={11} color={COLORS.critical} />}
+                </div>
+                <div style={{ width: 26 }}>
+                  <button onClick={() => removeRaidItem(item.id)} className="text-gray-300 hover:text-red-500">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+              {!expanded && (
+                <button
+                  onClick={() => setExpandedId(item.id)}
+                  className="flex items-center gap-1 text-[11px] text-gray-400 hover:text-gray-600 px-4 pb-2 -mt-1"
+                >
+                  <MessageSquare size={11} />
+                  {responses.length > 0 ? `${responses.length} response${responses.length > 1 ? "s" : ""}` : "Add a response"}
+                </button>
+              )}
+              {expanded && (
+                <div className="px-4 pb-3 -mt-1 pl-9">
+                  <div className="flex items-center gap-1 text-[11px] font-semibold text-gray-400 mb-1">
+                    <MessageSquare size={11} /> Risk responses
+                  </div>
+                  <NotesList
+                    items={responses}
+                    onAdd={(text) => addRaidResponse(item.id, text)}
+                    onRemove={(responseId) => removeRaidResponse(item.id, responseId)}
+                    placeholder="Log a response / mitigation action..."
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+        {visible.length === 0 && (
+          <div className="p-8 text-center text-sm text-gray-400">
+            {raidLog.length === 0
+              ? 'No RAID items yet. Click "Add" to log a risk, assumption, issue, or dependency.'
+              : "Nothing matches this filter."}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* =========================================================================
+   RESOURCES TAB
+========================================================================= */
+function ResourcesTab({
+  project,
+  load,
+  overallocations,
+  cost,
+  addResource,
+  updateResource,
+  removeResource,
+  toggleTaskResource,
+  wbsById,
+  selectedResourceId,
+  setSelectedResourceId,
+  projectStart,
+  projectDuration,
+}) {
+  const activeResource = selectedResourceId || project.resources[0]?.id;
+  const rMap = load.get(activeResource) || new Map();
+
+  const days = [];
+  for (let i = 0; i < Math.max(projectDuration, 1) + 2; i++) {
+    const d = dayIndexToDate(projectStart, i);
+    if (isWeekend(d)) continue;
+    days.push({ date: toISO(d), label: fmtShort(d) });
+  }
+
+  const resOverCount = new Map();
+  overallocations.forEach((o) => resOverCount.set(o.resourceId, (resOverCount.get(o.resourceId) || 0) + 1));
+
+  return (
+    <div className="flex-1 flex overflow-hidden" style={{ background: COLORS.canvas }}>
+      <div className="border-r border-gray-200 bg-white overflow-y-auto" style={{ width: 420, flexShrink: 0 }}>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+          <div className="flex items-center gap-2 font-semibold text-sm" style={{ color: COLORS.primaryDark }}>
+            <Users size={16} /> Resources
+          </div>
+          <button onClick={addResource} className="flex items-center gap-1 text-xs px-2 py-1 rounded text-white" style={{ background: COLORS.primary }}>
+            <Plus size={12} /> Add
+          </button>
+        </div>
+        {project.resources.map((r) => {
+          const taskCost = cost.byTask;
+          const resCost = project.tasks.reduce((sum, t) => {
+            const asn = (t.resources || []).find((a) => a.resourceId === r.id);
+            if (!asn) return sum;
+            return sum + t.duration * HOURS_PER_DAY * (asn.units / 100) * (r.rate || 0);
+          }, 0);
+          const overCount = resOverCount.get(r.id) || 0;
+          return (
+            <div
+              key={r.id}
+              onClick={() => setSelectedResourceId(r.id)}
+              className={`px-4 py-3 border-b border-gray-100 cursor-pointer ${activeResource === r.id ? "bg-gray-50" : ""}`}
+            >
+              <div className="flex items-center gap-2">
+                <input
+                  className="text-sm font-medium bg-transparent flex-1"
+                  value={r.name}
+                  onChange={(e) => updateResource(r.id, { name: e.target.value })}
+                  onClick={(e) => e.stopPropagation()}
+                />
+                {overCount > 0 && (
+                  <span className="flex items-center gap-0.5 text-[10px] text-red-600 font-semibold">
+                    <AlertTriangle size={11} /> {overCount}
+                  </span>
+                )}
+                <button onClick={(e) => { e.stopPropagation(); removeResource(r.id); }} className="text-gray-300 hover:text-red-500">
+                  <Trash2 size={13} />
+                </button>
+              </div>
+              <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-500">
+                <span>
+                  Rate $
+                  <input
+                    type="number"
+                    className="w-14 bg-transparent mono"
+                    value={r.rate}
+                    onChange={(e) => updateResource(r.id, { rate: parseFloat(e.target.value) || 0 })}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  /hr
+                </span>
+                <span>
+                  Max
+                  <input
+                    type="number"
+                    className="w-12 bg-transparent mono ml-1"
+                    value={r.maxUnits}
+                    onChange={(e) => updateResource(r.id, { maxUnits: parseFloat(e.target.value) || 100 })}
+                    onClick={(e) => e.stopPropagation()}
+                  />
+                  %
+                </span>
+                <span className="mono text-gray-400">${Math.round(resCost).toLocaleString()}</span>
+              </div>
+            </div>
+          );
+        })}
+
+        <div className="px-4 py-3 border-t border-gray-100 mt-2">
+          <div className="text-xs font-semibold text-gray-500 mb-2">Assignments per task</div>
+          {project.tasks.map((t) => (
+            <div key={t.id} className="mb-2">
+              <div className="text-xs font-medium text-gray-700 mb-1">
+                {wbsById.get(t.id)}. {t.name}
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {project.resources.map((r) => {
+                  const active = (t.resources || []).some((a) => a.resourceId === r.id);
+                  return (
+                    <button
+                      key={r.id}
+                      onClick={() => toggleTaskResource(t.id, r.id)}
+                      className="text-[10px] px-2 py-0.5 rounded-full border"
+                      style={
+                        active
+                          ? { background: COLORS.primary, color: "white", borderColor: COLORS.primary }
+                          : { color: COLORS.sub, borderColor: "#D8DEE6" }
+                      }
+                    >
+                      {r.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex-1 p-5 overflow-y-auto">
+        <div className="text-sm font-semibold mb-3" style={{ color: COLORS.primaryDark }}>
+          Daily allocation — {project.resources.find((r) => r.id === activeResource)?.name || "—"}
+        </div>
+        <div className="bg-white rounded-lg border border-gray-200 p-4">
+          {days.length === 0 ? (
+            <div className="text-sm text-gray-400">No scheduled days yet.</div>
+          ) : (
+            <div className="flex items-end gap-1 overflow-x-auto pb-2" style={{ height: 160 }}>
+              {days.map((d) => {
+                const units = rMap.get(d.date) || 0;
+                const res = project.resources.find((r) => r.id === activeResource);
+                const max = res?.maxUnits || 100;
+                const over = units > max + 0.01;
+                const h = Math.min(140, (units / Math.max(max, units, 1)) * 140);
+                return (
+                  <div key={d.date} className="flex flex-col items-center justify-end" style={{ width: 22, height: "100%" }} title={`${d.label}: ${units}%`}>
+                    <div
+                      style={{
+                        width: 14,
+                        height: Math.max(2, h),
+                        background: over ? COLORS.critical : units > 0 ? COLORS.primary : "#E4E8EE",
+                        borderRadius: 2,
+                      }}
+                    />
+                    <div className="text-[8px] text-gray-400 mt-1 rotate-0">{d.label.split(" ")[1]}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="text-[11px] text-gray-400 mt-2">Bars in red exceed the resource's max allocation for that day.</div>
+        </div>
+
+        {overallocations.length > 0 && (
+          <div className="mt-5 bg-white rounded-lg border border-red-200 p-4">
+            <div className="text-sm font-semibold text-red-600 mb-2 flex items-center gap-1">
+              <AlertTriangle size={14} /> Overallocation detail
+            </div>
+            <div className="text-xs text-gray-600 space-y-1 max-h-48 overflow-y-auto">
+              {overallocations.map((o, i) => {
+                const r = project.resources.find((rr) => rr.id === o.resourceId);
+                return (
+                  <div key={i} className="flex justify-between">
+                    <span>{r?.name}</span>
+                    <span className="mono">{o.date} — {o.units}% / {o.max}%</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
