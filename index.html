@@ -1,0 +1,1059 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>KATL Auction Night</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #0A1128; }
+  * { box-sizing: border-box; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useCallback } = React;
+
+const STORAGE_KEY = "katl-auction-v1";
+const LOCK_KEY = "katl-auction-unlocked";
+const AUCTION_PIN = "1403"; // change this to whatever code you want to share with the group
+
+const CAPTAINS = {
+  green: { name: "Vishal", rating: 3, role: "Batting", stats: null },
+  blue: { name: "Paresh B802", rating: 3, role: "All", stats: null },
+  red: { name: "Keya Chetan Anand", rating: 4, role: "Batting", stats: null },
+};
+
+const TEAM_META = {
+  green: { label: "Team Vishal", accent: "#34C77B", accentSoft: "rgba(52,199,123,0.14)" },
+  blue: { label: "Team Paresh", accent: "#4C8DFF", accentSoft: "rgba(76,141,255,0.14)" },
+  red: { label: "Team Chetan", accent: "#FF5D5D", accentSoft: "rgba(255,93,93,0.14)" },
+};
+
+// Career stats pulled from CricHeroes. Keyed by the CricHeroes short name;
+// players not on CricHeroes (e.g. Abhiishek Pal) simply have no stats entry.
+const STATS = {
+  "Aadhar": { mat: 104, inn: 97, runs: 2234, hs: "102", avg: 28.64, sr: 140.86, fifties: 12, hundreds: 1, ducks: 2, bowlInn: 95, overs: 284.2, wkts: 123, econ: 7.12, bowlAvg: 16.46, bowlSr: 13.87, best: "5/22" },
+  "Mohit Rana": { mat: 72, inn: 73, runs: 1305, hs: "74", avg: 20.39, sr: 136.36, fifties: 5, hundreds: 0, ducks: 8, bowlInn: 8, overs: 13.2, wkts: 6, econ: 11.25, bowlAvg: 25.00, bowlSr: 13.33, best: "2/12" },
+  "Suraj Nayak": { mat: 77, inn: 72, runs: 1192, hs: "116*", avg: 18.92, sr: 154.40, fifties: 1, hundreds: 1, ducks: 11, bowlInn: 76, overs: 250.3, wkts: 104, econ: 7.61, bowlAvg: 18.34, bowlSr: 14.45, best: "5/17" },
+  "Romy": { mat: 80, inn: 79, runs: 1146, hs: "68", avg: 17.36, sr: 108.22, fifties: 4, hundreds: 0, ducks: 8, bowlInn: 50, overs: 112.5, wkts: 40, econ: 8.46, bowlAvg: 23.88, bowlSr: 16.92, best: "4/19" },
+  "Paresh Prakhar": { mat: 148, inn: 120, runs: 1127, hs: "67*", avg: 13.26, sr: 108.05, fifties: 1, hundreds: 0, ducks: 20, bowlInn: 125, overs: 339.4, wkts: 128, econ: 7.53, bowlAvg: 19.98, bowlSr: 15.92, best: "5/7" },
+  "Rishav Jain": { mat: 81, inn: 75, runs: 956, hs: "66*", avg: 16.20, sr: 124.97, fifties: 3, hundreds: 0, ducks: 10, bowlInn: 16, overs: 31.3, wkts: 9, econ: 9.75, bowlAvg: 34.11, bowlSr: 21.00, best: "4/40" },
+  "Shanky": { mat: 126, inn: 97, runs: 950, hs: "79", avg: 14.39, sr: 97.74, fifties: 2, hundreds: 0, ducks: 14, bowlInn: 100, overs: 285.0, wkts: 120, econ: 8.60, bowlAvg: 20.43, bowlSr: 14.25, best: "6/20" },
+  "Ashutosh Gupta": { mat: 67, inn: 53, runs: 895, hs: "103", avg: 17.90, sr: 127.31, fifties: 3, hundreds: 1, ducks: 9, bowlInn: 19, overs: 34.0, wkts: 11, econ: 10.29, bowlAvg: 31.82, bowlSr: 18.55, best: "2/3" },
+  "Chetan Anand": { mat: 70, inn: 59, runs: 768, hs: "112*", avg: 15.06, sr: 123.67, fifties: 2, hundreds: 1, ducks: 9, bowlInn: 1, overs: 1.0, wkts: 0, econ: 16.00, bowlAvg: 0, bowlSr: 0, best: "0/16" },
+  "Soumalya Das": { mat: 136, inn: 94, runs: 692, hs: "43*", avg: 9.23, sr: 78.19, fifties: 0, hundreds: 0, ducks: 13, bowlInn: 96, overs: 228.2, wkts: 81, econ: 8.68, bowlAvg: 24.47, bowlSr: 16.91, best: "4/20" },
+  "Aditya Hegde": { mat: 60, inn: 55, runs: 678, hs: "50", avg: 13.56, sr: 142.74, fifties: 1, hundreds: 0, ducks: 4, bowlInn: 54, overs: 135.3, wkts: 51, econ: 7.91, bowlAvg: 21.02, bowlSr: 15.94, best: "5/18" },
+  "Ashish Gaur": { mat: 56, inn: 52, runs: 640, hs: "65*", avg: 14.55, sr: 120.53, fifties: 2, hundreds: 0, ducks: 7, bowlInn: 7, overs: 6.2, wkts: 4, econ: 17.53, bowlAvg: 27.75, bowlSr: 9.50, best: "2/15" },
+  "Vishal Sinha": { mat: 98, inn: 74, runs: 603, hs: "56", avg: 12.06, sr: 84.69, fifties: 1, hundreds: 0, ducks: 9, bowlInn: 14, overs: 16.1, wkts: 6, econ: 9.96, bowlAvg: 26.83, bowlSr: 16.17, best: "2/15" },
+  "Tarunendra Pratap Singh": { mat: 84, inn: 58, runs: 552, hs: "39", avg: 12.00, sr: 96.50, fifties: 0, hundreds: 0, ducks: 7, bowlInn: 60, overs: 170.2, wkts: 68, econ: 7.95, bowlAvg: 19.91, bowlSr: 15.03, best: "4/22" },
+  "Prashant Gupta": { mat: 49, inn: 41, runs: 457, hs: "45", avg: 15.76, sr: 101.56, fifties: 0, hundreds: 0, ducks: 4, bowlInn: 2, overs: 2.0, wkts: 2, econ: 8.50, bowlAvg: 8.50, bowlSr: 6.00, best: "2/2" },
+  "Nikhil Chandra": { mat: 55, inn: 50, runs: 436, hs: "47*", avg: 9.28, sr: 96.25, fifties: 0, hundreds: 0, ducks: 6, bowlInn: 19, overs: 33.0, wkts: 13, econ: 10.06, bowlAvg: 25.54, bowlSr: 15.23, best: "3/17" },
+  "Akashkumar Patel": { mat: 61, inn: 45, runs: 426, hs: "52", avg: 12.91, sr: 107.04, fifties: 3, hundreds: 0, ducks: 7, bowlInn: 53, overs: 139.5, wkts: 62, econ: 8.17, bowlAvg: 18.44, bowlSr: 13.53, best: "5/14" },
+  "Mohit Srivastava": { mat: 56, inn: 41, runs: 425, hs: "51*", avg: 14.17, sr: 107.32, fifties: 1, hundreds: 0, ducks: 7, bowlInn: 29, overs: 51.0, wkts: 20, econ: 11.27, bowlAvg: 28.75, bowlSr: 15.30, best: "3/22" },
+  "Abhinav Tiwari": { mat: 69, inn: 48, runs: 398, hs: "39*", avg: 15.92, sr: 101.27, fifties: 0, hundreds: 0, ducks: 5, bowlInn: 53, overs: 130.3, wkts: 64, econ: 7.59, bowlAvg: 15.48, bowlSr: 12.23, best: "5/11" },
+  "Bipul Jha": { mat: 57, inn: 43, runs: 368, hs: "74", avg: 11.50, sr: 87.62, fifties: 1, hundreds: 0, ducks: 6, bowlInn: 54, overs: 166.4, wkts: 63, econ: 7.43, bowlAvg: 19.65, bowlSr: 15.87, best: "5/23" },
+  "Shravan Hegde": { mat: 58, inn: 40, runs: 352, hs: "35", avg: 11.35, sr: 81.29, fifties: 0, hundreds: 0, ducks: 4, bowlInn: 56, overs: 168.5, wkts: 57, econ: 8.07, bowlAvg: 23.89, bowlSr: 17.77, best: "3/12" },
+  "Akash Dwivedi": { mat: 34, inn: 28, runs: 343, hs: "50", avg: 12.70, sr: 100.59, fifties: 1, hundreds: 0, ducks: 4, bowlInn: 12, overs: 26.0, wkts: 8, econ: 6.27, bowlAvg: 20.38, bowlSr: 19.50, best: "2/12" },
+  "Satrajit": { mat: 63, inn: 39, runs: 312, hs: "34", avg: 10.40, sr: 103.65, fifties: 0, hundreds: 0, ducks: 7, bowlInn: 62, overs: 194.4, wkts: 78, econ: 8.56, bowlAvg: 21.37, bowlSr: 14.97, best: "5/30" },
+  "Snehashish": { mat: 32, inn: 27, runs: 257, hs: "37", avg: 10.71, sr: 101.98, fifties: 0, hundreds: 0, ducks: 2, bowlInn: 27, overs: 53.0, wkts: 18, econ: 10.72, bowlAvg: 31.56, bowlSr: 17.67, best: "2/16" },
+  "Abhishek Bajaj": { mat: 19, inn: 17, runs: 252, hs: "37", avg: 18.00, sr: 116.13, fifties: 0, hundreds: 0, ducks: 1, bowlInn: 1, overs: 1.0, wkts: 0, econ: 11.00, bowlAvg: 0, bowlSr: 0, best: "0/11" },
+  "Ritik Arora": { mat: 29, inn: 25, runs: 233, hs: "63", avg: 11.65, sr: 122.63, fifties: 1, hundreds: 0, ducks: 2, bowlInn: 22, overs: 40.0, wkts: 14, econ: 10.12, bowlAvg: 28.93, bowlSr: 17.14, best: "3/24" },
+  "Praveen Kumar Shetty": { mat: 29, inn: 19, runs: 178, hs: "37", avg: 17.80, sr: 95.70, fifties: 0, hundreds: 0, ducks: 2, bowlInn: 24, overs: 65.4, wkts: 20, econ: 7.80, bowlAvg: 25.60, bowlSr: 19.70, best: "3/30" },
+  "Brijesh Bhatt": { mat: 41, inn: 21, runs: 101, hs: "19", avg: 9.18, sr: 93.52, fifties: 0, hundreds: 0, ducks: 3, bowlInn: 36, overs: 111.2, wkts: 49, econ: 8.70, bowlAvg: 19.78, bowlSr: 13.63, best: "5/30" },
+  "Rahul Arora": { mat: 29, inn: 16, runs: 97, hs: "30", avg: 8.08, sr: 97.98, fifties: 0, hundreds: 0, ducks: 4, bowlInn: 5, overs: 8.0, wkts: 9, econ: 8.50, bowlAvg: 7.56, bowlSr: 5.33, best: "3/3" },
+  "Anuraag": { mat: 27, inn: 15, runs: 85, hs: "28", avg: 8.50, sr: 73.91, fifties: 0, hundreds: 0, ducks: 2, bowlInn: 19, overs: 41.3, wkts: 19, econ: 8.22, bowlAvg: 17.95, bowlSr: 13.11, best: "4/13" },
+};
+
+CAPTAINS.green.stats = STATS["Vishal Sinha"] || null;
+CAPTAINS.blue.stats = STATS["Paresh Prakhar"] || null;
+CAPTAINS.red.stats = STATS["Chetan Anand"] || null;
+
+const POOL = [
+  ["Rishav B1705 ATL", 4, "Batting", "Rishav Jain"],
+  ["Shanky Keya", 3, "All", "Shanky"],
+  ["Soumalya Keya", 2, "All", "Soumalya Das"],
+  ["Keya Abhiishek Pal", 1, "Batting", null],
+  ["Praveen Keya Shetty", 3, "All", "Praveen Kumar Shetty"],
+  ["Romy Keya A1403", 3, "All", "Romy"],
+  ["Shravan Keya Hegde", 3, "All", "Shravan Hegde"],
+  ["Brijesh Keya Bhatt", 3, "All", "Brijesh Bhatt"],
+  ["Rahul Arora Keya", 2, "All", "Rahul Arora"],
+  ["Akash Keya Dwivedi", 3, "All", "Akash Dwivedi"],
+  ["Mohit Rana C0701", 5, "Batting", "Mohit Rana"],
+  ["Nikhil Keya", 2, "All", "Nikhil Chandra"],
+  ["Bipul Keya", 3, "All", "Bipul Jha"],
+  ["Ashish Gaur Keya", 4, "Batting", "Ashish Gaur"],
+  ["CA Aditya Hegde Keya", 4, "All", "Aditya Hegde"],
+  ["Abhinav Keya Tiwari", 3, "All", "Abhinav Tiwari"],
+  ["Aadhar Keya Hasija", 5, "All", "Aadhar"],
+  ["Suraj Keya A2007 Nayak", 5, "All", "Suraj Nayak"],
+  ["Mohit Srivastava", 2, "All", "Mohit Srivastava"],
+  ["Ritik Keya", 2, "All", "Ritik Arora"],
+  ["Anurag Keya", 2, "All", "Anuraag"],
+  ["Thakur Tarun Keya", 3, "All", "Tarunendra Pratap Singh"],
+  ["Keya Abhishek Bajaj", 4, "Batting", "Abhishek Bajaj"],
+  ["Akashkumar Patel Keya", 3, "All", "Akashkumar Patel"],
+  ["Ashutosh Keya Gupta", 2, "All", "Ashutosh Gupta"],
+  ["Snehasish", 2, "All", "Snehashish"],
+  ["Prashant Keya Gupta", 4, "Batting", "Prashant Gupta"],
+  ["Satrajit B1406", 3, "All", "Satrajit"],
+  ["Keya Lohit Dsa", 3, "All", null],
+  ["Mithun Vakharia", 3, "All", null],
+  ["Keya Ajay Prajapati", 3, "All", null],
+  ["Nikunj Agrawal", 3, "All", null],
+  ["Sagar Sharma", 3, "All", null],
+  ["Pankaj Keya B", 3, "All", null],
+  ["Ish", 3, "All", null],
+  ["Keya Jammie", 3, "All", null],
+  ["Niraj Nagulkar", 3, "All", null],
+].map(([name, rating, role, statsKey], i) => ({
+  id: `p${i}`,
+  name,
+  rating,
+  role,
+  base: rating * 4,
+  stats: statsKey ? STATS[statsKey] : null,
+}));
+
+const TEAMS_ORDER = ["green", "blue", "red"];
+
+function shuffledIds(list) {
+  const ids = list.map((p) => p.id);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+  }
+  return ids;
+}
+
+function freshState(purse) {
+  const teams = {};
+  TEAMS_ORDER.forEach((k) => {
+    teams[k] = { purse, spent: 0, roster: [] };
+  });
+  return {
+    phase: "setup",
+    purseStart: purse,
+    order: [],
+    idx: 0,
+    unsold: [],
+    teams,
+    history: [],
+  };
+}
+
+// --- plain localStorage helpers (synchronous, no hangs, no race conditions) ---
+function readLocal(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw === null ? fallback : raw;
+  } catch {
+    return fallback;
+  }
+}
+function writeLocal(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // best effort only
+  }
+}
+
+function App() {
+  const [state, setState] = useState(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      return raw ? JSON.parse(raw) : freshState(100);
+    } catch {
+      return freshState(100);
+    }
+  });
+  const [purseInput, setPurseInput] = useState(100);
+  const [bidTeam, setBidTeam] = useState(null);
+  const [bidAmount, setBidAmount] = useState("");
+  const [soldFlash, setSoldFlash] = useState(null);
+  const [error, setError] = useState("");
+  const [unlocked, setUnlocked] = useState(() => readLocal(LOCK_KEY, "no") === "yes");
+  const [pinInput, setPinInput] = useState("");
+  const [pinError, setPinError] = useState("");
+  const [showResetConfirm, setShowResetConfirm] = useState(false);
+
+  function tryUnlock() {
+    if (pinInput === AUCTION_PIN) {
+      setPinError("");
+      setUnlocked(true);
+      writeLocal(LOCK_KEY, "yes");
+    } else {
+      setPinError("Wrong code — try again.");
+    }
+  }
+
+  function lockAgain() {
+    setUnlocked(false);
+    setPinInput("");
+    writeLocal(LOCK_KEY, "no");
+  }
+
+  const persist = useCallback((next) => {
+    setState(next);
+    writeLocal(STORAGE_KEY, JSON.stringify(next));
+  }, []);
+
+  if (!unlocked) {
+    return (
+      <div style={S.appShell}>
+        <style>{CSS}</style>
+        <div style={S.floodTop} />
+        <div style={{ ...S.container, maxWidth: 380, paddingTop: 60 }}>
+          <header style={S.header}>
+            <div style={S.eyebrow}>KATL · WEEKEND LEAGUE</div>
+            <h1 style={S.title}>AUCTION NIGHT</h1>
+            <div style={S.subtitle}>Enter the code to open the auction</div>
+          </header>
+          <div style={S.setupCard}>
+            <input
+              type="password"
+              inputMode="numeric"
+              placeholder="Enter code"
+              value={pinInput}
+              onChange={(e) => setPinInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && tryUnlock()}
+              style={{ ...S.purseInput, width: "100%", textAlign: "center", fontSize: 20, letterSpacing: 4, marginBottom: 14 }}
+              autoFocus
+            />
+            <button style={S.primaryBtn} onClick={tryUnlock}>
+              <span style={{ marginRight: 8 }}>✓</span> Unlock
+            </button>
+            {pinError && <div style={{ ...S.errorText, textAlign: "center", marginTop: 12 }}>{pinError}</div>}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const currentPlayer =
+    state.phase === "auction" && state.idx < state.order.length
+      ? POOL.find((p) => p.id === state.order[state.idx])
+      : null;
+
+  function startAuction() {
+    const purse = Math.max(10, Number(purseInput) || 100);
+    const order = shuffledIds(POOL);
+    persist({ ...freshState(purse), phase: "auction", order });
+  }
+
+  function resetAll() {
+    setShowResetConfirm(true);
+  }
+
+  function confirmReset() {
+    persist(freshState(state.purseStart || 100));
+    setBidTeam(null);
+    setBidAmount("");
+    setShowResetConfirm(false);
+  }
+
+  function goNext(s) {
+    const nextIdx = s.idx + 1;
+    if (nextIdx >= s.order.length) {
+      if (s.unsold.length > 0) {
+        return { ...s, order: [...s.order, ...shuffledIds(s.unsold.map((id) => POOL.find((p) => p.id === id)))], unsold: [], idx: nextIdx };
+      }
+      return { ...s, idx: nextIdx };
+    }
+    return { ...s, idx: nextIdx };
+  }
+
+  function confirmSale() {
+    setError("");
+    if (!currentPlayer || !bidTeam) {
+      setError("Pick a team first.");
+      return;
+    }
+    const price = Number(bidAmount);
+    if (!price || price <= 0) {
+      setError("Enter a valid sale price.");
+      return;
+    }
+    const team = state.teams[bidTeam];
+    if (price > team.purse) {
+      setError(`${TEAM_META[bidTeam].label} only has ${team.purse} left.`);
+      return;
+    }
+    const nextTeams = {
+      ...state.teams,
+      [bidTeam]: {
+        ...team,
+        purse: team.purse - price,
+        spent: team.spent + price,
+        roster: [...team.roster, { ...currentPlayer, price }],
+      },
+    };
+    const history = [...state.history, { type: "sale", team: bidTeam, player: currentPlayer, price }];
+    const advanced = goNext({ ...state, teams: nextTeams, history });
+    persist(advanced);
+    setSoldFlash({ name: currentPlayer.name, team: bidTeam });
+    setTimeout(() => setSoldFlash(null), 1100);
+    setBidTeam(null);
+    setBidAmount("");
+  }
+
+  function markUnsold() {
+    if (!currentPlayer) return;
+    const history = [...state.history, { type: "unsold", player: currentPlayer }];
+    const withUnsold = { ...state, unsold: [...state.unsold, currentPlayer.id], history };
+    persist(goNext(withUnsold));
+    setBidTeam(null);
+    setBidAmount("");
+    setError("");
+  }
+
+  function undoLast() {
+    const h = state.history;
+    if (h.length === 0) return;
+    const last = h[h.length - 1];
+    if (last.type === "sale") {
+      const team = state.teams[last.team];
+      const nextTeams = {
+        ...state.teams,
+        [last.team]: {
+          ...team,
+          purse: team.purse + last.price,
+          spent: team.spent - last.price,
+          roster: team.roster.filter((r) => r.id !== last.player.id),
+        },
+      };
+      persist({ ...state, teams: nextTeams, idx: state.idx - 1, history: h.slice(0, -1) });
+    } else if (last.type === "unsold") {
+      persist({ ...state, unsold: state.unsold.filter((id) => id !== last.player.id), idx: state.idx - 1, history: h.slice(0, -1) });
+    }
+  }
+
+  function exportToExcel() {
+    const wb = XLSX.utils.book_new();
+
+    const summaryRows = [["Team", "Captain", "Purse Used", "Purse Left", "Players"]];
+    TEAMS_ORDER.forEach((k) => {
+      const team = state.teams[k];
+      summaryRows.push([
+        TEAM_META[k].label,
+        CAPTAINS[k].name,
+        team.spent,
+        team.purse,
+        team.roster.length + 1,
+      ]);
+    });
+    const summarySheet = XLSX.utils.aoa_to_sheet(summaryRows);
+    XLSX.utils.book_append_sheet(wb, summarySheet, "Summary");
+
+    TEAMS_ORDER.forEach((k) => {
+      const team = state.teams[k];
+      const rows = [["Player", "Role", "Price"]];
+      rows.push([CAPTAINS[k].name + " (C)", CAPTAINS[k].role, "—"]);
+      team.roster.forEach((r) => rows.push([r.name, r.role, r.price]));
+      const sheet = XLSX.utils.aoa_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, sheet, TEAM_META[k].label.replace("Team ", ""));
+    });
+
+    if (state.unsold.length > 0) {
+      const rows = [["Player", "Role"]];
+      state.unsold.forEach((id) => {
+        const p = POOL.find((pl) => pl.id === id);
+        if (p) rows.push([p.name, p.role]);
+      });
+      const sheet = XLSX.utils.aoa_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, sheet, "Unsold");
+    }
+
+    const statsRows = [[
+      "Player", "Mat", "Inn", "Runs", "HS", "Avg", "SR", "50s", "100s", "Ducks",
+      "Bowl Inn", "Overs", "Wkts", "Econ", "Bowl Avg", "Bowl SR", "Best",
+    ]];
+    POOL.forEach((p) => {
+      if (!p.stats) return;
+      const s = p.stats;
+      statsRows.push([p.name, s.mat, s.inn, s.runs, s.hs, s.avg, s.sr, s.fifties, s.hundreds, s.ducks, s.bowlInn, s.overs, s.wkts, s.econ, s.bowlAvg, s.bowlSr, s.best]);
+    });
+    TEAMS_ORDER.forEach((k) => {
+      const s = CAPTAINS[k].stats;
+      if (!s) return;
+      statsRows.push([CAPTAINS[k].name + " (C)", s.mat, s.inn, s.runs, s.hs, s.avg, s.sr, s.fifties, s.hundreds, s.ducks, s.bowlInn, s.overs, s.wkts, s.econ, s.bowlAvg, s.bowlSr, s.best]);
+    });
+    const statsSheet = XLSX.utils.aoa_to_sheet(statsRows);
+    XLSX.utils.book_append_sheet(wb, statsSheet, "Career Stats");
+
+    XLSX.writeFile(wb, "KATL-Auction-Results.xlsx");
+  }
+
+  const soldCount = TEAMS_ORDER.reduce((acc, k) => acc + state.teams[k].roster.length, 0);
+  const remaining = Math.max(0, state.order.length - state.idx);
+  const isComplete = state.phase === "auction" && state.idx >= state.order.length && state.unsold.length === 0;
+
+  return (
+    <div style={S.appShell}>
+      <style>{CSS}</style>
+      <div style={S.floodTop} />
+      <div style={S.container}>
+        <header style={S.header}>
+          <div style={S.eyebrow}>KATL · WEEKEND LEAGUE</div>
+          <h1 style={S.title}>AUCTION NIGHT</h1>
+          <div style={S.subtitle}>Live player draft — one screen, three captains, one purse each</div>
+          <button style={{ ...S.ghostBtn, margin: "14px auto 0" }} onClick={lockAgain}>
+            Lock screen
+          </button>
+        </header>
+
+        {state.phase === "setup" && (
+          <div style={S.setupCard}>
+            <div style={S.setupRow}>
+              <span style={{ fontSize: 18 }}>👥</span>
+              <span style={{ color: S.colors.textMuted, fontFamily: S.fonts.body }}>
+                {POOL.length} players in the pool · 3 captains locked in already
+              </span>
+            </div>
+            <div style={S.captainRow}>
+              {TEAMS_ORDER.map((k) => (
+                <div key={k} style={{ ...S.captainChip, borderColor: TEAM_META[k].accent }}>
+                  <div style={{ ...S.dot, background: TEAM_META[k].accent }} />
+                  <div>
+                    <div style={S.captainName}>{CAPTAINS[k].name}</div>
+                    <div style={S.captainSub}>{TEAM_META[k].label} · {CAPTAINS[k].role}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={S.purseSetup}>
+              <label style={S.purseLabel}>Purse per team (credits)</label>
+              <input
+                type="number"
+                value={purseInput}
+                onChange={(e) => setPurseInput(e.target.value)}
+                style={S.purseInput}
+                min={10}
+              />
+            </div>
+            <button style={S.primaryBtn} onClick={startAuction}>
+              <span style={{ marginRight: 8 }}>🔀</span>
+              Shuffle pool &amp; begin auction
+            </button>
+          </div>
+        )}
+
+        {state.phase === "auction" && !isComplete && currentPlayer && (
+          <React.Fragment>
+            <div style={S.progressBar}>
+              <div style={{ ...S.progressFill, width: `${(soldCount / POOL.length) * 100}%` }} />
+              <span style={S.progressText}>
+                {soldCount}/{POOL.length} sold · {remaining} left in this round
+                {state.unsold.length > 0 ? ` · ${state.unsold.length} pending re-auction` : ""}
+              </span>
+            </div>
+
+            <div style={S.blockWrap}>
+              <div style={S.spotlight} />
+              <div style={S.blockCard} key={currentPlayer.id}>
+                <div style={S.onBlockLabel}>ON THE BLOCK</div>
+                <div style={S.playerName}>{currentPlayer.name}</div>
+                <div style={S.playerMeta}>
+                  <span style={S.roleTag}>{currentPlayer.role}</span>
+                </div>
+
+                {currentPlayer.stats ? (
+                  <div style={S.statsGrid}>
+                    <div style={S.statsCol}>
+                      <div style={S.statsColHead}>Batting</div>
+                      <div style={S.statLine}><span>Matches</span><span>{currentPlayer.stats.mat}</span></div>
+                      <div style={S.statLine}><span>Runs</span><span>{currentPlayer.stats.runs}</span></div>
+                      <div style={S.statLine}><span>Average</span><span>{currentPlayer.stats.avg}</span></div>
+                      <div style={S.statLine}><span>Strike rate</span><span>{currentPlayer.stats.sr}</span></div>
+                      <div style={S.statLine}><span>HS</span><span>{currentPlayer.stats.hs}</span></div>
+                      <div style={S.statLine}><span>50s / 100s</span><span>{currentPlayer.stats.fifties} / {currentPlayer.stats.hundreds}</span></div>
+                    </div>
+                    <div style={S.statsCol}>
+                      <div style={S.statsColHead}>Bowling</div>
+                      <div style={S.statLine}><span>Innings</span><span>{currentPlayer.stats.bowlInn}</span></div>
+                      <div style={S.statLine}><span>Overs</span><span>{currentPlayer.stats.overs}</span></div>
+                      <div style={S.statLine}><span>Wickets</span><span>{currentPlayer.stats.wkts}</span></div>
+                      <div style={S.statLine}><span>Economy</span><span>{currentPlayer.stats.econ}</span></div>
+                      <div style={S.statLine}><span>Bowl avg</span><span>{currentPlayer.stats.bowlAvg}</span></div>
+                      <div style={S.statLine}><span>Best</span><span>{currentPlayer.stats.best}</span></div>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={S.statsMissing}>No CricHeroes stats on file for this player.</div>
+                )}
+
+                <div style={S.teamPickRow}>
+                  {TEAMS_ORDER.map((k) => (
+                    <button
+                      key={k}
+                      onClick={() => setBidTeam(k)}
+                      style={{
+                        ...S.teamPickBtn,
+                        borderColor: TEAM_META[k].accent,
+                        background: bidTeam === k ? TEAM_META[k].accent : "transparent",
+                        color: bidTeam === k ? "#0A1128" : TEAM_META[k].accent,
+                      }}
+                    >
+                      {TEAM_META[k].label.replace("Team ", "")}
+                      <span style={S.pursePill}>{state.teams[k].purse} left</span>
+                    </button>
+                  ))}
+                </div>
+
+                <div style={S.saleRow}>
+                  <input
+                    type="number"
+                    placeholder="Sale price"
+                    value={bidAmount}
+                    onChange={(e) => setBidAmount(e.target.value)}
+                    style={S.saleInput}
+                  />
+                  <button style={S.soldBtn} onClick={confirmSale} disabled={!bidTeam}>
+                    <span style={{ marginRight: 6 }}>✓</span> SOLD
+                  </button>
+                  <button style={S.unsoldBtn} onClick={markUnsold}>
+                    <span style={{ marginRight: 6 }}>✕</span> Unsold
+                  </button>
+                </div>
+                {error && <div style={S.errorText}>{error}</div>}
+              </div>
+            </div>
+
+            <div style={S.undoRow}>
+              <button style={S.ghostBtn} onClick={undoLast} disabled={state.history.length === 0}>
+                <span style={{ marginRight: 6 }}>↩</span> Undo last
+              </button>
+              <button style={S.ghostBtn} onClick={resetAll}>
+                <span style={{ marginRight: 6 }}>↺</span> Reset auction
+              </button>
+              <button style={S.ghostBtn} onClick={exportToExcel}>
+                <span style={{ marginRight: 6 }}>⬇</span> Export so far
+              </button>
+            </div>
+          </React.Fragment>
+        )}
+
+        {isComplete && (
+          <div style={S.completeWrap}>
+            <div style={S.completeHeader}>
+              <span style={{ fontSize: 22 }}>🏆</span>
+              <span style={S.completeTitle}>AUCTION COMPLETE</span>
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center", marginBottom: 20 }}>
+              <button style={S.primaryBtnSmall} onClick={exportToExcel}>
+                <span style={{ marginRight: 6 }}>⬇</span> Download final teams (Excel)
+              </button>
+              <button style={S.ghostBtn} onClick={resetAll}>
+                <span style={{ marginRight: 6 }}>↺</span> Start a new auction
+              </button>
+            </div>
+          </div>
+        )}
+
+        {(state.phase === "auction") && (
+          <div style={S.teamsGrid}>
+            {TEAMS_ORDER.map((k) => {
+              const team = state.teams[k];
+              const purseUsedPct = ((state.purseStart - team.purse) / state.purseStart) * 100;
+              return (
+                <div key={k} style={{ ...S.teamCard, borderColor: TEAM_META[k].accent }}>
+                  <div style={S.teamCardHead}>
+                    <div style={{ ...S.dot, background: TEAM_META[k].accent }} />
+                    <div style={S.teamCardTitle}>{TEAM_META[k].label}</div>
+                  </div>
+                  <div style={S.teamStatRow}>
+                    <span style={S.teamStatLabel}>Purse left</span>
+                    <span style={{ ...S.teamStatValue, color: TEAM_META[k].accent }}>{team.purse}</span>
+                  </div>
+                  <div style={S.gaugeTrack}>
+                    <div style={{ ...S.gaugeFill, width: `${purseUsedPct}%`, background: TEAM_META[k].accent }} />
+                  </div>
+                  <ul style={S.rosterList}>
+                    <li style={S.rosterCaptainRow}>
+                      <span>{CAPTAINS[k].name} (C)</span>
+                      <span style={S.rosterCaptainTag}>captain</span>
+                    </li>
+                    {team.roster.map((r) => (
+                      <li key={r.id} style={S.rosterRow}>
+                        <span>{r.name}</span>
+                        <span style={S.rosterPrice}>{r.price}</span>
+                      </li>
+                    ))}
+                    {team.roster.length === 0 && <li style={S.rosterEmpty}>No players yet</li>}
+                  </ul>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {soldFlash && (
+        <div style={S.stampOverlay}>
+          <div style={{ ...S.stamp, borderColor: TEAM_META[soldFlash.team].accent, color: TEAM_META[soldFlash.team].accent }}>
+            SOLD
+          </div>
+        </div>
+      )}
+
+      {showResetConfirm && (
+        <div style={S.confirmOverlay}>
+          <div style={S.confirmCard}>
+            <div style={S.confirmTitle}>Reset the whole auction?</div>
+            <div style={S.confirmBody}>This clears every sale, every purse, and every roster. This can't be undone.</div>
+            <div style={S.confirmRow}>
+              <button style={S.confirmCancelBtn} onClick={() => setShowResetConfirm(false)}>
+                Cancel
+              </button>
+              <button style={S.confirmDangerBtn} onClick={confirmReset}>
+                Yes, reset
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const CSS = `
+  @keyframes stampIn {
+    0% { transform: scale(2.4) rotate(-18deg); opacity: 0; }
+    60% { transform: scale(0.92) rotate(-10deg); opacity: 1; }
+    100% { transform: scale(1) rotate(-10deg); opacity: 1; }
+  }
+  @keyframes glowPulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+  @keyframes blockIn {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+`;
+
+const colors = {
+  bg: "#0A1128",
+  panel: "#101A3D",
+  panelSoft: "#0D1633",
+  border: "rgba(255,255,255,0.08)",
+  text: "#F5F3EC",
+  textMuted: "#8B93B8",
+  gold: "#E8B944",
+};
+
+const fonts = {
+  display: "'Arial Narrow', 'Helvetica Neue', Arial, sans-serif",
+  body: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+  mono: "'SF Mono', 'Roboto Mono', 'Courier New', monospace",
+};
+
+const S = {
+  colors,
+  fonts,
+  appShell: {
+    minHeight: "100vh",
+    background: `radial-gradient(ellipse 120% 60% at 50% -10%, #16204a 0%, ${colors.bg} 55%)`,
+    padding: "24px 16px 60px",
+    position: "relative",
+    overflow: "hidden",
+    fontFamily: fonts.body,
+  },
+  floodTop: {
+    position: "absolute",
+    top: -120,
+    left: "50%",
+    transform: "translateX(-50%)",
+    width: "80%",
+    height: 200,
+    background: "radial-gradient(ellipse, rgba(232,185,68,0.18) 0%, transparent 70%)",
+    animation: "glowPulse 5s ease-in-out infinite",
+    pointerEvents: "none",
+  },
+  container: { maxWidth: 880, margin: "0 auto", position: "relative" },
+  header: { textAlign: "center", marginBottom: 24 },
+  eyebrow: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    letterSpacing: 3,
+    color: colors.gold,
+    marginBottom: 6,
+  },
+  title: {
+    fontFamily: fonts.display,
+    fontWeight: 800,
+    fontStretch: "condensed",
+    fontSize: "clamp(34px, 8vw, 56px)",
+    letterSpacing: 4,
+    margin: 0,
+    color: colors.text,
+    textTransform: "uppercase",
+  },
+  subtitle: { color: colors.textMuted, fontSize: 13, marginTop: 6 },
+
+  setupCard: {
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 16,
+    padding: 24,
+  },
+  setupRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 18 },
+  captainRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px,1fr))", gap: 10, marginBottom: 20 },
+  captainChip: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    border: "1px solid",
+    borderRadius: 12,
+    padding: "10px 12px",
+    background: colors.panelSoft,
+  },
+  dot: { width: 10, height: 10, borderRadius: "50%", flexShrink: 0 },
+  captainName: { color: colors.text, fontWeight: 700, fontSize: 14 },
+  captainSub: { color: colors.textMuted, fontSize: 11, marginTop: 2 },
+  purseSetup: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 },
+  purseLabel: { color: colors.textMuted, fontSize: 13, fontFamily: fonts.body },
+  purseInput: {
+    background: colors.panelSoft,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    color: colors.text,
+    padding: "8px 12px",
+    fontFamily: fonts.mono,
+    fontSize: 15,
+    width: 100,
+  },
+  primaryBtn: {
+    width: "100%",
+    background: colors.gold,
+    color: "#1A1300",
+    border: "none",
+    borderRadius: 10,
+    padding: "14px 18px",
+    fontWeight: 800,
+    letterSpacing: 1,
+    fontSize: 14,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    textTransform: "uppercase",
+  },
+
+  progressBar: {
+    position: "relative",
+    height: 26,
+    background: colors.panelSoft,
+    borderRadius: 999,
+    border: `1px solid ${colors.border}`,
+    marginBottom: 22,
+    overflow: "hidden",
+  },
+  progressFill: {
+    position: "absolute",
+    inset: 0,
+    background: "linear-gradient(90deg, rgba(232,185,68,0.35), rgba(232,185,68,0.6))",
+    transition: "width 0.4s ease",
+  },
+  progressText: {
+    position: "relative",
+    display: "block",
+    textAlign: "center",
+    lineHeight: "26px",
+    fontSize: 11,
+    color: colors.text,
+    fontFamily: fonts.mono,
+    letterSpacing: 0.5,
+  },
+
+  blockWrap: { position: "relative", marginBottom: 18 },
+  spotlight: {
+    position: "absolute",
+    inset: "-30px -10px",
+    background: "radial-gradient(ellipse 70% 60% at 50% 30%, rgba(232,185,68,0.10) 0%, transparent 70%)",
+    pointerEvents: "none",
+  },
+  blockCard: {
+    position: "relative",
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 20,
+    padding: "28px 24px",
+    textAlign: "center",
+    animation: "blockIn 0.35s ease",
+  },
+  onBlockLabel: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    letterSpacing: 3,
+    color: colors.gold,
+    marginBottom: 10,
+  },
+  playerName: {
+    fontFamily: fonts.display,
+    fontSize: "clamp(24px, 5vw, 34px)",
+    fontWeight: 800,
+    color: colors.text,
+    textTransform: "uppercase",
+    letterSpacing: 1,
+  },
+  playerMeta: { display: "flex", alignItems: "center", justifyContent: "center", gap: 12, marginTop: 10, color: colors.gold, fontSize: 15 },
+  roleTag: {
+    fontFamily: fonts.mono,
+    fontSize: 11,
+    color: colors.textMuted,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 999,
+    padding: "3px 10px",
+  },
+
+  statsGrid: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 16,
+    marginTop: 18,
+    textAlign: "left",
+    background: colors.panelSoft,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 12,
+    padding: "14px 16px",
+  },
+  statsCol: {},
+  statsColHead: {
+    fontFamily: fonts.mono,
+    fontSize: 10,
+    letterSpacing: 2,
+    color: colors.gold,
+    marginBottom: 8,
+    textTransform: "uppercase",
+  },
+  statLine: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 12.5,
+    color: colors.text,
+    padding: "3px 0",
+  },
+  statsMissing: {
+    marginTop: 16,
+    fontSize: 12,
+    color: colors.textMuted,
+    fontStyle: "italic",
+  },
+
+  teamPickRow: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginTop: 22 },
+  teamPickBtn: {
+    border: "2px solid",
+    borderRadius: 12,
+    padding: "10px 8px",
+    background: "transparent",
+    fontWeight: 700,
+    fontSize: 13,
+    cursor: "pointer",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    gap: 4,
+    transition: "all 0.15s ease",
+  },
+  pursePill: { fontFamily: fonts.mono, fontSize: 10, opacity: 0.85 },
+
+  saleRow: { display: "flex", gap: 8, marginTop: 16 },
+  saleInput: {
+    flex: 1,
+    background: colors.panelSoft,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    color: colors.text,
+    padding: "10px 12px",
+    fontFamily: fonts.mono,
+    fontSize: 15,
+    minWidth: 0,
+  },
+  soldBtn: {
+    background: colors.gold,
+    color: "#1A1300",
+    border: "none",
+    borderRadius: 8,
+    padding: "10px 16px",
+    fontWeight: 800,
+    letterSpacing: 0.5,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    whiteSpace: "nowrap",
+  },
+  unsoldBtn: {
+    background: "transparent",
+    color: colors.textMuted,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    padding: "10px 14px",
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+    whiteSpace: "nowrap",
+  },
+  errorText: { color: "#FF8A8A", fontSize: 12, marginTop: 10, fontFamily: fonts.body },
+
+  undoRow: { display: "flex", gap: 10, justifyContent: "center", marginBottom: 28, flexWrap: "wrap" },
+  ghostBtn: {
+    background: "transparent",
+    color: colors.textMuted,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    padding: "8px 14px",
+    fontSize: 12,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+  },
+
+  primaryBtnSmall: {
+    background: colors.gold,
+    color: "#1A1300",
+    border: "none",
+    borderRadius: 8,
+    padding: "8px 14px",
+    fontWeight: 800,
+    fontSize: 12,
+    letterSpacing: 0.5,
+    cursor: "pointer",
+    display: "flex",
+    alignItems: "center",
+  },
+  completeWrap: { textAlign: "center", marginBottom: 20 },
+  completeHeader: { display: "flex", alignItems: "center", justifyContent: "center", gap: 10, marginBottom: 10 },
+  completeTitle: {
+    fontFamily: fonts.display,
+    fontSize: 26,
+    fontWeight: 800,
+    letterSpacing: 3,
+    color: colors.text,
+  },
+
+  teamsGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px,1fr))", gap: 14 },
+  teamCard: {
+    background: colors.panel,
+    border: "1px solid",
+    borderRadius: 16,
+    padding: 16,
+  },
+  teamCardHead: { display: "flex", alignItems: "center", gap: 8, marginBottom: 12 },
+  teamCardTitle: { fontWeight: 800, color: colors.text, fontSize: 14, textTransform: "uppercase", letterSpacing: 0.5 },
+  teamStatRow: { display: "flex", justifyContent: "space-between", fontSize: 12, color: colors.textMuted, marginBottom: 4 },
+  teamStatLabel: {},
+  teamStatValue: { fontFamily: fonts.mono, fontWeight: 700, color: colors.text },
+  gaugeTrack: { height: 6, background: colors.panelSoft, borderRadius: 999, overflow: "hidden", marginBottom: 12 },
+  gaugeFill: { height: "100%", transition: "width 0.4s ease" },
+  rosterList: { listStyle: "none", margin: 0, padding: 0, maxHeight: 220, overflowY: "auto" },
+  rosterRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 12.5,
+    color: colors.text,
+    padding: "6px 0",
+    borderBottom: `1px solid ${colors.border}`,
+  },
+  rosterCaptainRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    fontSize: 12.5,
+    color: colors.gold,
+    padding: "6px 0",
+    borderBottom: `1px solid ${colors.border}`,
+    fontWeight: 700,
+  },
+  rosterCaptainTag: { fontFamily: fonts.mono, fontSize: 9, opacity: 0.8, textTransform: "uppercase" },
+  rosterPrice: { fontFamily: fonts.mono, color: colors.gold },
+  rosterEmpty: { color: colors.textMuted, fontSize: 12, fontStyle: "italic", padding: "6px 0" },
+
+  stampOverlay: {
+    position: "fixed",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    pointerEvents: "none",
+    zIndex: 50,
+  },
+  stamp: {
+    fontFamily: fonts.display,
+    fontSize: 64,
+    fontWeight: 900,
+    letterSpacing: 6,
+    border: "6px solid",
+    borderRadius: 12,
+    padding: "10px 30px",
+    background: "rgba(10,17,40,0.7)",
+    animation: "stampIn 0.5s cubic-bezier(.2,1.4,.4,1)",
+  },
+
+  confirmOverlay: {
+    position: "fixed",
+    inset: 0,
+    background: "rgba(5,8,20,0.72)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 60,
+    padding: 20,
+  },
+  confirmCard: {
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 16,
+    padding: 24,
+    maxWidth: 340,
+    width: "100%",
+    animation: "blockIn 0.2s ease",
+  },
+  confirmTitle: {
+    fontFamily: fonts.display,
+    fontSize: 20,
+    fontWeight: 800,
+    color: colors.text,
+    marginBottom: 10,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+  },
+  confirmBody: { color: colors.textMuted, fontSize: 13, marginBottom: 20, lineHeight: 1.5 },
+  confirmRow: { display: "flex", gap: 10 },
+  confirmCancelBtn: {
+    flex: 1,
+    background: "transparent",
+    color: colors.textMuted,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 8,
+    padding: "10px 14px",
+    cursor: "pointer",
+    fontSize: 13,
+  },
+  confirmDangerBtn: {
+    flex: 1,
+    background: "#FF5D5D",
+    color: "#1A0A0A",
+    border: "none",
+    borderRadius: 8,
+    padding: "10px 14px",
+    cursor: "pointer",
+    fontWeight: 800,
+    fontSize: 13,
+  },
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
